@@ -485,9 +485,9 @@ int main() {
 
 
     float lightIntensity = 5000.0f;   // 线性衰减 1/dist，地球 ≈ 5.0
-    float flareIntensity = 0.4f;
+    float flareIntensity = 1.2f;
     float ssaoStrength = 0.8f;
-    float coronaIntensity = 0.15f;
+    float coronaIntensity = 0.5f;
     float kSunRadius = 15.0f;  // 与 config.ini 同步，用于角度计算
 
     while (!glfwWindowShouldClose(window)) {
@@ -564,11 +564,21 @@ int main() {
         float simTime = (float)glfwGetTime() * config.timeScale;
         for (auto& p : planets) p.update(simTime);
 
+        glm::vec3 viewPos = camera.getPosition();
+        glm::mat4 view = camera.getViewMatrix();
+
+        // dynamic near plane: adapt to camera proximity to nearest planet surface
+        float dynamicNear = 0.1f;
+        for (auto& p : planets) {
+            float distToSurface = glm::length(p.getPosition() - viewPos) - p.getSize();
+            if (distToSurface < 0.0f) distToSurface = 0.001f;
+            float nearForThis = distToSurface * 0.5f;
+            if (nearForThis < dynamicNear) dynamicNear = nearForThis;
+        }
+        if (dynamicNear < 0.001f) dynamicNear = 0.001f;
         glm::mat4 proj = glm::perspective(glm::radians(camera.getFov()),
                                           (float)g_screenWidth / g_screenHeight,
-                                          0.1f, 80000.0f);
-        glm::mat4 view = camera.getViewMatrix();
-        glm::vec3 viewPos = camera.getPosition();
+                                          dynamicNear, 80000.0f);
 
         // ================================================================
         // Pass 1: G-Buffer 渲染 (MRT: color + normal + depth)
@@ -583,7 +593,7 @@ int main() {
         // 太阳：纯 emissive，写 G-Buffer
         for (auto& p : planets) {
             if (p.isSun()) {
-                p.drawEmissive(sunShader, sphere.VAO, sphere.indexCount, view, proj, viewPos, 3.0f);
+                p.drawEmissive(sunShader, sphere.VAO, sphere.indexCount, view, proj, viewPos, 10.0f);
             }
         }
         // 诊断：线框模式
@@ -782,8 +792,14 @@ int main() {
                 if (clip.w <= 0.0f) continue;
                 glm::vec3 ndc = glm::vec3(clip) / clip.w;
                 float distToPlanet = glm::length(planetPos - viewPos);
-                float angRadius = glm::atan(p.getSize() / distToPlanet);
+                // 有大气层的行星：日冕过滤范围 = 大气球体半径 (pSize*1.15)，与渲染边界对齐
+                // 无大气层的行星：日冕过滤范围 = 行星半径 +8% 边距
+                float bodySize = p.hasAtmosphere() ? p.getSize() * 1.15f : p.getSize();
+                float angRadius = glm::atan(bodySize / distToPlanet);
                 float ndcRadius = glm::tan(angRadius) / glm::tan(fovY * 0.5f);
+                // 大气球体已有精确的渲染半径，无需膨胀；普通行星留 8% 防边缘泄漏
+                float inflate = p.hasAtmosphere() ? 1.0f : 1.08f;
+                ndcRadius *= inflate;
                 glUniform2f(centerLoc + eclipseCount, ndc.x, ndc.y);
                 glUniform1f(radiusLoc + eclipseCount, ndcRadius);
                 eclipseCount++;
@@ -893,7 +909,7 @@ int main() {
         glUniform1i(glGetUniformLocation(finalShader, "autoExposure"), g_autoExposure ? 1 : 0);
         glUniform1f(glGetUniformLocation(finalShader, "fixedExposure"), g_fixedExposure);
         glUniform1f(glGetUniformLocation(finalShader, "manualExposure"), g_manualExposure);
-        glUniform1f(glGetUniformLocation(finalShader, "bloomStrength"), g_bloomEnabled ? 0.15f : 0.0f);
+        glUniform1f(glGetUniformLocation(finalShader, "bloomStrength"), g_bloomEnabled ? 0.4f : 0.0f);
         glUniform1i(glGetUniformLocation(finalShader, "directOutput"), g_directOutput ? 1 : 0);
         glBindVertexArray(quadVAO);
         glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
@@ -1002,6 +1018,7 @@ int main() {
                     if (distToSun > 0.1f) {
                         glm::vec3 sunDir = toSun / distToSun;
                         float sunAngRadius = glm::atan(kSunRadius / distToSun);  // 太阳角半径
+                        float worstOcclude = 0.0f;
                         for (size_t i = 1; i < planets.size(); i++) {  // 跳过太阳自身
                             glm::vec3 planetPos = planets[i].getPosition();
                             glm::vec3 toPlanet = planetPos - cameraPos;
@@ -1010,18 +1027,17 @@ int main() {
                                 glm::vec3 planetDir = toPlanet / distToPlanet;
                                 float cosAng = glm::clamp(glm::dot(planetDir, sunDir), -1.0f, 1.0f);
                                 float angSep = glm::acos(cosAng);  // 角距离
-                                float planetAngRadius = glm::atan(planets[i].getSize() / distToPlanet);
+                                float planetAngRadius = glm::atan(planets[i].getSize() / distToPlanet) * 1.08f;
                                 if (angSep < planetAngRadius + sunAngRadius) {
-                                    // 部分或完全遮挡 — 用平滑过渡替代硬阈值
                                     float overlap = (planetAngRadius + sunAngRadius) - angSep;
                                     float occludeRatio = overlap / (2.0f * sunAngRadius);
-                                    // smoothstep: 遮挡从 0.3 开始平滑过渡到 1.0
                                     float occludeFactor = glm::smoothstep(0.3f, 1.0f, occludeRatio);
-                                    sunVisible *= (1.0f - occludeFactor);
-                                    break;  // 一个行星遮挡就够
+                                    worstOcclude = fmaxf(worstOcclude, occludeFactor);
                                 }
                             }
                         }
+                        // planet完全遮挡 → 炫光完全消失
+                        sunVisible = sunVisible * (1.0f - worstOcclude);
                     }
                 }
             }

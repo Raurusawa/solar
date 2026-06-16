@@ -27,14 +27,27 @@ void main() {
     vec3 glowColor = mix(vec3(1.0, 0.28, 0.04), vec3(1.0, 0.92, 0.60), 1.0 / (1.0 + nd * 0.7));
     flare += glowColor * glow * 1.1;
 
-    // anamorphic streak
-    float shVsigma = max(r * 0.38, 0.0001);
-    float shV = exp(-toSun.y * toSun.y / (2.0 * shVsigma * shVsigma));
-    float shLen = max(0.4 - r * 1.5, 0.005);
-    float shH = exp(-toSun.x * toSun.x * uAspectRatio * uAspectRatio / (2.0 * shLen * shLen));
-    float hT = abs(toSun.x * uAspectRatio) / max(shLen, 0.001);
-    vec3 shColor = mix(vec3(1.0,0.82,0.45), vec3(0.35,0.55,1.0), clamp(hT,0.0,1.0));
-    flare += shColor * shV * shH * 2.0;
+    // === cross streaks (horizontal + vertical) ===
+    // 越远(r小)越明显、越短；越近(r大)越不明显
+    float pointness = 1.0 / (1.0 + r / 0.02);   // small r = point-like = visible
+    float streakEnergy = pointness * 0.5;         // visibility only
+
+    vec2 dUV = uv - uSunPos;
+    float dx = dUV.x * uAspectRatio;
+    float dy = dUV.y;
+
+    float shThin = max(r * 0.38, 0.0005);        // scales with r
+    float shLen  = max(r * 6.0, 0.003);          // shorter when far, longer when near
+
+    // horizontal (0)
+    float h0 = exp(-dy * dy / (2.0 * shThin * shThin))
+             * exp(-dx * dx / (2.0 * shLen * shLen));
+    // vertical (90)
+    float h90 = exp(-dx * dx / (2.0 * shThin * shThin))
+              * exp(-dy * dy / (2.0 * shLen * shLen));
+
+    vec3 streakColor = mix(vec3(1.0,0.82,0.45), vec3(0.35,0.55,1.0), 0.3);
+    flare += streakColor * (h0 + h90) * streakEnergy;
 
     // ghosts
     vec2 centerDir = uSunPos - vec2(0.5);
