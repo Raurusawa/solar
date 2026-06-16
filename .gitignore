@@ -1,0 +1,35 @@
+# Build outputs
+*.exe
+*.o
+solar_system
+
+# Libraries (system-installed via MSYS2)
+glew32.dll
+glfw3.dll
+
+# Screenshots & temp images
+*.png
+screenshot*.png
+
+# IDE / WorkBuddy
+.workbuddy/
+.vscode/
+
+# Temp / backup files
+*~
+.Makefile.un~
+Makefile~
+*.tmp
+
+# Logs / debug output
+out.txt
+stdout.txt
+stderr.txt
+wget-log
+
+# OS files
+Thumbs.db
+Desktop.ini
+
+# Cache
+__pycache__/
