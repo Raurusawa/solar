@@ -484,7 +484,7 @@ int main() {
 
     bool bPressedLast = false, nPressedLast = false, tPressedLast = false;
     bool lPressedLast = false, plusPressedLast = false, minusPressedLast = false;
-    bool zPressedLast = false, gPressedLast = false, fPressedLast = false, xPressedLast = false;
+    bool zPressedLast = false, gPressedLast = false, vPressedLast = false, xPressedLast = false;
 
 
     float lightIntensity = 5000.0f;   // 线性衰减 1/dist，地球 ≈ 5.0
@@ -535,7 +535,7 @@ int main() {
             g_debugGBuffer = !g_debugGBuffer;
             std::cout << "[INFO] G-Buffer direct: " << (g_debugGBuffer ? "ON" : "OFF") << std::endl;
         }
-        if (glfwGetKey(window, GLFW_KEY_F) == GLFW_PRESS && !fPressedLast) {
+        if (glfwGetKey(window, GLFW_KEY_V) == GLFW_PRESS && !vPressedLast) {
             g_wireframe = !g_wireframe;
             std::cout << "[INFO] Wireframe: " << (g_wireframe ? "ON" : "OFF") << std::endl;
         }
@@ -549,7 +549,7 @@ int main() {
         lPressedLast = (glfwGetKey(window, GLFW_KEY_L) == GLFW_PRESS);
         zPressedLast = (glfwGetKey(window, GLFW_KEY_Z) == GLFW_PRESS);
         gPressedLast = (glfwGetKey(window, GLFW_KEY_G) == GLFW_PRESS);
-        fPressedLast = (glfwGetKey(window, GLFW_KEY_F) == GLFW_PRESS);
+        vPressedLast = (glfwGetKey(window, GLFW_KEY_V) == GLFW_PRESS);
         xPressedLast = (glfwGetKey(window, GLFW_KEY_X) == GLFW_PRESS);
         plusPressedLast = (glfwGetKey(window, GLFW_KEY_KP_ADD) == GLFW_PRESS);
         minusPressedLast = (glfwGetKey(window, GLFW_KEY_KP_SUBTRACT) == GLFW_PRESS);
