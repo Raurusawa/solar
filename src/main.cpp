@@ -443,8 +443,11 @@ int main() {
     lumShader = createShaderProgram(postVertexSrc, lumFragSrc.c_str());
     if (!lumShader) { std::cerr << "Luminance shader failed!" << std::endl; return -1; }
 
-    SphereMesh sphere = createSphere(1.0f, 64, 32);
-    std::cout << "[DEBUG] Sphere indices: " << sphere.indexCount << std::endl;
+    SphereLOD sphereLOD = createSphereLOD();
+    std::cout << "[DEBUG] LOD indices: "
+              << sphereLOD.levels[0].indexCount << " / "
+              << sphereLOD.levels[1].indexCount << " / "
+              << sphereLOD.levels[2].indexCount << std::endl;
 
     Camera camera(config.cameraPos, config.cameraYaw, config.cameraPitch, config.cameraRoll,
                   config.cameraFov, config.cameraSpeed, config.cameraSensitivity);
@@ -590,20 +593,25 @@ int main() {
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
         checkGLError("G-Buffer clear");
 
-        // 太阳：纯 emissive，写 G-Buffer
-        for (auto& p : planets) {
-            if (p.isSun()) {
-                p.drawEmissive(sunShader, sphere.VAO, sphere.indexCount, view, proj, viewPos, 10.0f);
+        // 太阳：纯 emissive，写 G-Buffer（太阳始终用最高精度 LOD0）
+        {
+            auto lod = sphereLOD.levels[0];
+            for (auto& p : planets) {
+                if (p.isSun()) {
+                    p.drawEmissive(sunShader, lod.VAO, lod.indexCount, view, proj, viewPos, 10.0f);
+                }
             }
         }
         // 诊断：线框模式
         if (g_wireframe) {
             glPolygonMode(GL_FRONT_AND_BACK, GL_LINE);
         }
-        // 行星：从太阳接收光照，每个面独立计算 PBR
+        // 行星：从太阳接收光照，每行星按距离动态选 LOD
         for (auto& p : planets) {
             if (!p.isSun()) {
-                p.draw(planetShader, sphere.VAO, sphere.indexCount, view, proj, viewPos, lightIntensity, sunRadius);
+                float dist = glm::length(p.getPosition() - viewPos);
+                auto lod = selectLOD(sphereLOD, dist, p.getSize(), config.cameraFov, g_screenHeight);
+                p.draw(planetShader, lod.VAO, lod.indexCount, view, proj, viewPos, lightIntensity, sunRadius);
             }
         }
         checkGLError("planet draw");
@@ -631,8 +639,10 @@ int main() {
                 glm::vec3 sunDN = glm::normalize(sunPos - p.getPosition());
                 glUniform3fv(glGetUniformLocation(atmosphereShader, "sunDir"), 1, glm::value_ptr(sunDN));
                 glUniform3fv(glGetUniformLocation(atmosphereShader, "cameraPos"), 1, glm::value_ptr(viewPos));
-                glBindVertexArray(sphere.VAO);
-                glDrawElements(GL_TRIANGLES, sphere.indexCount, GL_UNSIGNED_INT, 0);
+                float dist = glm::length(p.getPosition() - viewPos);
+                auto lod = selectLOD(sphereLOD, dist, atmosR, config.cameraFov, g_screenHeight);
+                glBindVertexArray(lod.VAO);
+                glDrawElements(GL_TRIANGLES, lod.indexCount, GL_UNSIGNED_INT, 0);
             }
         }
         glDepthMask(GL_TRUE);
@@ -657,8 +667,8 @@ int main() {
             glUniformMatrix4fv(glGetUniformLocation(redShader, "model"), 1, GL_FALSE, glm::value_ptr(model));
             glUniformMatrix4fv(glGetUniformLocation(redShader, "view"), 1, GL_FALSE, glm::value_ptr(view));
             glUniformMatrix4fv(glGetUniformLocation(redShader, "projection"), 1, GL_FALSE, glm::value_ptr(proj));
-            glBindVertexArray(sphere.VAO);
-            glDrawElements(GL_TRIANGLES, sphere.indexCount, GL_UNSIGNED_INT, 0);
+            glBindVertexArray(sphereLOD.levels[1].VAO);  // LOD1 for diagnostic sphere
+            glDrawElements(GL_TRIANGLES, sphereLOD.levels[1].indexCount, GL_UNSIGNED_INT, 0);
             checkGLError("red sphere draw");
         }
 
@@ -1068,7 +1078,7 @@ int main() {
     glDeleteBuffers(1, &quadVBO);
     glDeleteVertexArrays(1, &axisVAO);
     glDeleteBuffers(1, &axisVBO);
-    deleteSphere(sphere);
+    deleteSphereLOD(sphereLOD);
     glDeleteProgram(sunShader);
     glDeleteProgram(planetShader);
     glDeleteProgram(lensFlareShader);

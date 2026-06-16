@@ -89,3 +89,39 @@ void deleteSphere(SphereMesh& mesh) {
     glDeleteBuffers(1, &mesh.VBO);
     glDeleteBuffers(1, &mesh.EBO);
 }
+
+// ========== LOD 系统 ==========
+
+SphereLOD createSphereLOD() {
+    SphereLOD lod;
+    // LOD 0: 近距高精度 — 128×64
+    lod.levels[0] = createSphere(1.0f, 128, 64);
+    // LOD 1: 中距标准 — 64×32
+    lod.levels[1] = createSphere(1.0f, 64, 32);
+    // LOD 2: 远距低精度 — 32×16
+    lod.levels[2] = createSphere(1.0f, 32, 16);
+    return lod;
+}
+
+LODSelection selectLOD(const SphereLOD& lod, float distToPlanet, float planetRadius, float fovYDeg, int screenHeight) {
+    // 行星在屏幕上的角半径 (弧度)
+    float angRadius = atan(planetRadius / distToPlanet);
+    // 垂直FOV下每像素对应的弧度
+    float fovYRad = fovYDeg * M_PI / 180.0f;
+    float radPerPixel = fovYRad / screenHeight;
+    // 行星在屏幕上的像素半径
+    float pixelRadius = angRadius / radPerPixel;
+
+    // 阈值：屏幕像素半径 > 150 → LOD0, > 50 → LOD1, else → LOD2
+    if (pixelRadius > 150.0f)
+        return { lod.levels[0].VAO, lod.levels[0].indexCount };
+    else if (pixelRadius > 50.0f)
+        return { lod.levels[1].VAO, lod.levels[1].indexCount };
+    else
+        return { lod.levels[2].VAO, lod.levels[2].indexCount };
+}
+
+void deleteSphereLOD(SphereLOD& lod) {
+    for (int i = 0; i < LOD_COUNT; i++)
+        deleteSphere(lod.levels[i]);
+}
