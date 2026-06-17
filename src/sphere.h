@@ -13,7 +13,7 @@ void deleteSphere(SphereMesh& mesh);
 
 // ========== LOD 系统 ==========
 
-constexpr int LOD_COUNT = 3;
+constexpr int LOD_COUNT = 4;
 
 struct SphereLOD {
     SphereMesh levels[LOD_COUNT];

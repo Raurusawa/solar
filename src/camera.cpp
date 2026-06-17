@@ -3,15 +3,15 @@
 #include <glm/gtc/quaternion.hpp>
 #include <cmath>
 
-Camera::Camera(glm::vec3 pos, float yaw, float pitch, float roll, float fov, float speed, float sensitivity)
+Camera::Camera(glm::dvec3 pos, float yaw, float pitch, float roll, float fov, float speed, float sensitivity)
     : position(pos), worldUp(0.0f, 1.0f, 0.0f),
       fov(fov), movementSpeed(speed), mouseSensitivity(sensitivity), currentSpeed(speed) {
     // 用旧系统的 front 公式构造初始方向，保证与 config.ini 兼容
-    glm::vec3 f;
-    f.x = cos(glm::radians(yaw)) * cos(glm::radians(pitch));
-    f.y = sin(glm::radians(pitch));
-    f.z = sin(glm::radians(yaw)) * cos(glm::radians(pitch));
-    front = glm::normalize(f);
+    glm::dvec3 f_d;
+    f_d.x = cos(glm::radians(yaw)) * cos(glm::radians(pitch));
+    f_d.y = sin(glm::radians(pitch));
+    f_d.z = sin(glm::radians(yaw)) * cos(glm::radians(pitch));
+    front = glm::normalize(glm::vec3(f_d));
 
     // 直接从 front 构建正交基
     right = glm::normalize(glm::cross(front, worldUp));
@@ -52,13 +52,17 @@ void Camera::processKeyboard(int key, int action, float) {
 }
 
 void Camera::update(float deltaTime) {
-    float velocity = currentSpeed * deltaTime;
-    if (keyW) position += front * velocity;
-    if (keyS) position -= front * velocity;
-    if (keyA) position -= right * velocity;
-    if (keyD) position += right * velocity;
-    if (keyR) position += up * velocity;
-    if (keyF) position -= up * velocity;
+    double dvelocity = (double)currentSpeed * (double)deltaTime;
+    // 将单精度方向向量转为双精度位移
+    glm::dvec3 f_d(front.x, front.y, front.z);
+    glm::dvec3 r_d(right.x, right.y, right.z);
+    glm::dvec3 u_d(up.x,    up.y,    up.z);
+    if (keyW) position += f_d * dvelocity;
+    if (keyS) position -= f_d * dvelocity;
+    if (keyA) position -= r_d * dvelocity;
+    if (keyD) position += r_d * dvelocity;
+    if (keyR) position += u_d * dvelocity;
+    if (keyF) position -= u_d * dvelocity;
 
     // Q/E 滚转：绕视线方向 (local Z)
     const float rollSpeed = 50.0f;
@@ -86,13 +90,16 @@ void Camera::processMouseMovement(float xoffset, float yoffset) {
 }
 
 void Camera::processMouseScroll(float yoffset) {
-    // 乘法缩放：每格滚轮缩放 1.5x 或 1/1.5x
+    // 乘法缩放：每格滚轮缩放 1.5x 或 1/1.5x，无上限但不可为0
     float factor = 1.0f + yoffset * 0.5f;
     currentSpeed *= factor;
-    if (currentSpeed < 0.5f)   currentSpeed = 0.5f;
-    if (currentSpeed > 10000.0f) currentSpeed = 10000.0f;
+    // 合理的速度范围：1e-6 ~ 1e12（覆盖从微米/秒到天文单位/秒）
+    if (currentSpeed < 1e-6f) currentSpeed = 1e-6f;
+    if (currentSpeed > 1e12f) currentSpeed = 1e12f;
 }
 
 glm::mat4 Camera::getViewMatrix() const {
-    return glm::lookAt(position, position + front, up);
+    // 将双精度位置转为单精度传递给OpenGL（视图矩阵本身用单精度计算）
+    glm::vec3 posF = glm::vec3(position);
+    return glm::lookAt(posF, posF + front, up);
 }

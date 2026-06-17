@@ -5,7 +5,7 @@
 
 class Camera {
 public:
-    Camera(glm::vec3 pos, float yaw, float pitch, float roll, float fov, float speed, float sensitivity);
+    Camera(glm::dvec3 pos, float yaw, float pitch, float roll, float fov, float speed, float sensitivity);
 
     void processKeyboard(int key, int action, float deltaTime);
     void processMouseMovement(float xoffset, float yoffset);
@@ -13,12 +13,17 @@ public:
     void update(float deltaTime);
     glm::mat4 getViewMatrix() const;
     float getFov() const { return fov; }
-    glm::vec3 getPosition() const { return position; }
+    glm::dvec3 getPosition() const { return position; }
     glm::vec3 getFront() const { return front; }
+    float getYaw() const { return glm::degrees(glm::yaw(orientation)); }
+    float getPitch() const { return glm::degrees(glm::pitch(orientation)); }
+    float getRoll() const { return glm::degrees(glm::roll(orientation)); }
+    float getSpeed() const { return movementSpeed; }
+    float getSensitivity() const { return mouseSensitivity; }
 
 private:
     void updateVectors();
-    glm::vec3 position;
+    glm::dvec3 position;       // 双精度位置，避免大坐标下精度丢失
     glm::vec3 front;
     glm::vec3 up;
     glm::vec3 right;

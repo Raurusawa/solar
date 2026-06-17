@@ -1,58 +1,49 @@
-from PIL import Image
-import numpy as np
+"""更详细地分析 Mars PAK 结构"""
+import zipfile
+from collections import defaultdict
 
-img = Image.open(r'c:\Users\nico_\Desktop\solar\screenshot4.png')
-arr = np.array(img)
-h, w = arr.shape[:2]
-print(f"Full screenshot: {w}x{h}")
+PAK = r'c:\Users\nico_\Desktop\solar\textures\textures\planets\Mars-Surface-PBC.pak'
+zf = zipfile.ZipFile(PAK)
 
-# 逐行找暗色行（OpenGL背景通常是纯黑）
-print("\nRows with >80% dark pixels (OpenGL window region):")
-dark_rows = []
-for y in range(h):
-    dark = (arr[y,:,:].max(axis=1) < 20).sum()
-    if dark > w * 0.8:
-        dark_rows.append(y)
+all_names = zf.namelist()
+jpg_files = [n for n in all_names if n.endswith('.jpg')]
+print(f"Total JPG: {len(jpg_files)}")
 
-if dark_rows:
-    # 找连续区间
-    breaks = [i for i in range(1, len(dark_rows)) if dark_rows[i] - dark_rows[i-1] > 1]
-    regions = []
-    start = dark_rows[0]
-    for b in breaks:
-        regions.append((start, dark_rows[b-1]))
-        start = dark_rows[b]
-    regions.append((start, dark_rows[-1]))
-    for s, e in regions:
-        print(f"  Dark region: rows {s}-{e} ({e-s+1} rows)")
-else:
-    print("  No dark rows found. Screen might be outside window.")
+# 按面 + 层级分组
+level_data = defaultdict(lambda: defaultdict(list))
+face_names = ['pos_x','neg_x','pos_y','neg_y','pos_z','neg_z']
 
-# 找亮色行
-print("\nRows with >80% bright pixels:")
-for y in range(0, h, 50):
-    bright = ((arr[y,:,0] > 200) & (arr[y,:,1] > 200) & (arr[y,:,2] > 200)).sum()
-    if bright > w * 0.8:
-        print(f"  Row {y}: {bright}/{w} bright")
+for n in jpg_files:
+    if '/' not in n or 'base' in n:
+        continue
+    parts = n.strip('/').split('/')
+    face = None
+    for p in parts:
+        if p in face_names: face = p; break
+    if not face: continue
+    # e.g. "0_0_0.jpg" → level=0, x=0, y=0
+    fname = parts[-1]
+    segs = fname.rsplit('.',1)[0].split('_')
+    if len(segs) < 3: continue
+    try:
+        lvl = int(segs[0])
+    except: continue
+    level_data[lvl][face].append(n)
 
-# 垂直方向颜色剖面
-print("\nVertical profile (col center, every 20 rows):")
-col_center = arr[:, w//2, :]
-for y in range(0, h, 20):
-    r, g, b = col_center[y, 0], col_center[y, 1], col_center[y, 2]
-    tag = ""
-    if r < 20 and g < 20 and b < 20: tag = " DARK"
-    elif r > 230 and g > 230 and b > 230: tag = " WHITE"
-    elif r > 200 and g > 150 and b < 50: tag = " GOLD"
-    print(f"  y={y:4d}: RGB({r:3d},{g:3d},{b:3d}){tag}")
+print("\n--- Levels found ---")
+for lvl in sorted(level_data.keys()):
+    counts = {f: len(level_data[lvl][f]) for f in face_names if f in level_data[lvl]}
+    grid_size = int(counts[max(counts, key=counts.get)] ** 0.5)
+    print(f"  LOD {lvl}: {dict(counts)} ~grid={grid_size}")
 
-# 水平方向颜色剖面（中间行）
-print(f"\nHorizontal profile (row {h//2}, every 30 cols):")
-mid_row = arr[h//2, :, :]
-for x in range(0, w, 30):
-    r, g, b = mid_row[x, 0], mid_row[x, 1], mid_row[x, 2]
-    tag = ""
-    if r < 20 and g < 20 and b < 20: tag = " DARK"
-    elif r > 230 and g > 230 and b > 230: tag = " WHITE"
-    elif r > 200 and g > 150 and b < 50: tag = " GOLD"
-    print(f"  x={x:4d}: RGB({r:3d},{g:3d},{b:3d}){tag}")
+# 读一个瓦片看尺寸
+for lvl in sorted(level_data.keys()):
+    for face in face_names:
+        if face in level_data[lvl]:
+            data = zf.read(level_data[lvl][face][0])
+            from PIL import Image
+            import io
+            im = Image.open(io.BytesIO(data))
+            print(f"\nTile size: {im.size} (LOD {lvl}, {face})")
+            break
+    break

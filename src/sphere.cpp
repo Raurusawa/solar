@@ -6,6 +6,7 @@
 #include <vector>
 #include <glm/glm.hpp>
 #include <cmath>
+#include <iostream>
 
 SphereMesh createSphere(float radius, int sectorCount, int stackCount) {
     std::vector<float> vertices;
@@ -16,16 +17,16 @@ SphereMesh createSphere(float radius, int sectorCount, int stackCount) {
     float lengthInv = 1.0f / radius;
 
     for (int i = 0; i <= stackCount; ++i) {
-        float stackAngle = M_PI / 2.0f - i * stackStep; // pi/2 到 -pi/2
-        float xy = radius * cosf(stackAngle);
-        float z = radius * sinf(stackAngle);
+        float stackAngle = M_PI / 2.0f - i * stackStep; // pi/2(北极) 到 -pi/2(南极)
+        float xz = radius * cosf(stackAngle);  // 赤道半径
+        float y = radius * sinf(stackAngle);   // Y轴=极轴, Y+=北极
 
         for (int j = 0; j <= sectorCount; ++j) {
             float sectorAngle = j * sectorStep;
-            float x = xy * cosf(sectorAngle);
-            float y = xy * sinf(sectorAngle);
+            float x = xz * cosf(sectorAngle);
+            float z = xz * sinf(sectorAngle);
             vertices.push_back(x);
-            vertices.push_back(y);
+            vertices.push_back(y);   // Y=极轴 (纹理北极在Y+)
             vertices.push_back(z);
             // 法线
             vertices.push_back(x * lengthInv);
@@ -94,12 +95,14 @@ void deleteSphere(SphereMesh& mesh) {
 
 SphereLOD createSphereLOD() {
     SphereLOD lod;
-    // LOD 0: 近距高精度 — 128×64
-    lod.levels[0] = createSphere(1.0f, 128, 64);
-    // LOD 1: 中距标准 — 64×32
-    lod.levels[1] = createSphere(1.0f, 64, 32);
-    // LOD 2: 远距低精度 — 32×16
-    lod.levels[2] = createSphere(1.0f, 32, 16);
+    // LOD 0: 极近距超高精度 — 384×192
+    lod.levels[0] = createSphere(1.0f, 384, 192);
+    // LOD 1: 近距高精度 — 192×96
+    lod.levels[1] = createSphere(1.0f, 192, 96);
+    // LOD 2: 中距标准 — 96×48
+    lod.levels[2] = createSphere(1.0f, 96, 48);
+    // LOD 3: 远距低精度 — 48×24
+    lod.levels[3] = createSphere(1.0f, 48, 24);
     return lod;
 }
 
@@ -112,13 +115,24 @@ LODSelection selectLOD(const SphereLOD& lod, float distToPlanet, float planetRad
     // 行星在屏幕上的像素半径
     float pixelRadius = angRadius / radPerPixel;
 
-    // 阈值：屏幕像素半径 > 150 → LOD0, > 50 → LOD1, else → LOD2
-    if (pixelRadius > 150.0f)
-        return { lod.levels[0].VAO, lod.levels[0].indexCount };
-    else if (pixelRadius > 50.0f)
-        return { lod.levels[1].VAO, lod.levels[1].indexCount };
-    else
-        return { lod.levels[2].VAO, lod.levels[2].indexCount };
+    // 相机与行星表面的距离（以行星半径为单位）
+    float distInRadii = distToPlanet / planetRadius;
+
+    // 双重策略：屏幕空间 + 绝对近距离保护
+    int lodLevel = 3;
+    if (pixelRadius > 60.0f || distInRadii < 3.0f)       lodLevel = 0;
+    else if (pixelRadius > 20.0f || distInRadii < 10.0f)   lodLevel = 1;
+    else if (pixelRadius > 8.0f || distInRadii < 30.0f)    lodLevel = 2;
+
+    // 诊断：对极远距离或小卫星每60帧打印一次LOD
+    static int frameCounter = 0;
+    frameCounter++;
+    if (pixelRadius > 10.0f && frameCounter % 60 == 0) {
+        std::cout << "[LOD] pixR=" << pixelRadius << " distR=" << distInRadii
+                  << " -> LOD" << lodLevel << " iCount=" << lod.levels[lodLevel].indexCount << std::endl;
+    }
+
+    return { lod.levels[lodLevel].VAO, lod.levels[lodLevel].indexCount };
 }
 
 void deleteSphereLOD(SphereLOD& lod) {

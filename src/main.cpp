@@ -3,6 +3,9 @@
 #include <iostream>
 #include <vector>
 #include <random>
+#include <ctime>
+#include <cmath>
+#include <cstdio>
 #include <glm/glm.hpp>
 #include <glm/gtc/matrix_transform.hpp>
 #include <glm/gtc/type_ptr.hpp>
@@ -12,12 +15,16 @@
 #include "sphere.h"
 #include "planet.h"
 #include "texture.h"
+#include "text_renderer.h"
+#include "menu.h"
 
 Camera* g_camera = nullptr;
+float* g_pTimeScale = nullptr;  // 指向 config.timeScale，供 Shift+滚轮 调整
 float g_lastX, g_lastY;
 bool g_firstMouse = true;
 float g_deltaTime = 0.0f;
 float g_lastFrame = 0.0f;
+double g_simTime = 0.0;  // 累积模拟时间（秒），受 timeScale 控制流速。double 防止精度丢失导致行星瞬移
 int g_screenWidth = 1280;
 int g_screenHeight = 720;
 bool g_bloomEnabled = true;
@@ -30,27 +37,58 @@ bool g_extremeDiagnose = false;    // X 键：极端隔离，G-Buffer 后直接 
 bool g_wireframe = false;          // F 键：线框模式
 float g_manualExposure = 0.0f;    // 手动曝光补偿，±2 EV
 float g_fixedExposure = 1.0f;      // 固定曝光值（autoExposure=false 时使用）
+int   g_resolutionIndex = 0;         // 当前分辨率索引
+bool  g_fullscreen = false;           // 是否全屏
 float g_adaptedLogLum = log(0.05f);  // 自动曝光用，初始化为一个合理值
+TextRenderer* g_textRenderer = nullptr;
+int g_lastFps = 0;
+Menu g_menu;
 
 // ======================= Luminance FBO (auto-exposure) =======================
 unsigned int lumFBOs[12], lumTex[12];
 unsigned int avgLumTex = 0;
 unsigned int lumShader = 0;
 int g_numLumPasses = 0;
+bool g_fboDirty = false;  // FBO 需要重建
 
 void framebuffer_size_callback(GLFWwindow*, int w, int h) {
     glViewport(0, 0, w, h);
     g_screenWidth = w;
     g_screenHeight = h;
+    if (g_textRenderer) g_textRenderer->resize(w, h);
+    g_fboDirty = true;
 }
 void mouse_callback(GLFWwindow*, double xpos, double ypos) {
+    if (!g_menu.isGameplay()) {
+        g_menu.handleMousePos(xpos, ypos);
+        return;
+    }
     if (g_firstMouse) { g_lastX = xpos; g_lastY = ypos; g_firstMouse = false; }
     float xoffset = xpos - g_lastX;
     float yoffset = g_lastY - ypos;
     g_lastX = xpos; g_lastY = ypos;
     g_camera->processMouseMovement(xoffset, yoffset);
 }
-void scroll_callback(GLFWwindow*, double, double yoffset) {
+void mouse_button_callback(GLFWwindow*, int button, int action, int) {
+    if (!g_menu.isGameplay()) {
+        g_menu.handleMouseButton(button, action);
+    }
+}
+void scroll_callback(GLFWwindow* window, double, double yoffset) {
+    if (!g_menu.isGameplay()) {
+        g_menu.handleScroll(yoffset);
+        return;
+    }
+    // Shift + 滚轮：等比调整时间流速
+    if (glfwGetKey(window, GLFW_KEY_LEFT_SHIFT) == GLFW_PRESS ||
+        glfwGetKey(window, GLFW_KEY_RIGHT_SHIFT) == GLFW_PRESS) {
+        if (g_pTimeScale && *g_pTimeScale > 0.0f) {
+            float factor = 1.0f + (float)yoffset * 0.5f;
+            *g_pTimeScale *= factor;
+            if (*g_pTimeScale < 0.001f) *g_pTimeScale = 0.001f;
+        }
+        return;
+    }
     g_camera->processMouseScroll(static_cast<float>(yoffset));
 }
 
@@ -72,6 +110,7 @@ void checkGLError(const char* context) {
 
 // ======================== 全屏四边形 ========================
 unsigned int quadVAO = 0, quadVBO = 0;
+unsigned int pointVAO = 0, pointVBO = 0;  // sub-pixel 天体点精灵
 void createQuad() {
     float quadVertices[] = {
         -1.0f,  1.0f, 0.0f, 0.0f, 1.0f,
@@ -186,6 +225,35 @@ void createSSAOFBO(int w, int h) {
     checkGLError("createSSAOFBO");
 }
 
+// ======================== Sun Emissive FBO (独立太阳亮度) ========================
+unsigned int sunEmissiveFBO, sunEmissiveTex, sunEmissiveDepth;
+
+void createSunEmissiveFBO(int w, int h) {
+    glGenFramebuffers(1, &sunEmissiveFBO);
+    glBindFramebuffer(GL_FRAMEBUFFER, sunEmissiveFBO);
+
+    glGenTextures(1, &sunEmissiveTex);
+    glBindTexture(GL_TEXTURE_2D, sunEmissiveTex);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA16F, w, h, 0, GL_RGBA, GL_FLOAT, nullptr);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, sunEmissiveTex, 0);
+
+    // 独立深度 buffer
+    glGenRenderbuffers(1, &sunEmissiveDepth);
+    glBindRenderbuffer(GL_RENDERBUFFER, sunEmissiveDepth);
+    glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH_COMPONENT24, w, h);
+    glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, sunEmissiveDepth);
+
+    GLenum status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+    std::cout << "[DEBUG] SunEmissive FBO " << sunEmissiveFBO << " "
+              << (status == GL_FRAMEBUFFER_COMPLETE ? "OK" : "FAIL") << std::endl;
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    checkGLError("createSunEmissiveFBO");
+}
+
 // ======================== Scene FBO (composite output) ========================
 unsigned int sceneFBO, sceneTex;
 
@@ -232,6 +300,73 @@ bool createBlurFBOs(int w, int h) {
     }
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
     checkGLError("createBlurFBOs");
+    return true;
+}
+
+// ======================== 重建所有 FBO（分辨率变更时调用）=======================
+void deleteFBOs() {
+    glDeleteFramebuffers(1, &gBufferFBO);  gBufferFBO = 0;
+    glDeleteTextures(1, &gColorTex);    gColorTex = 0;
+    glDeleteTextures(1, &gNormalTex);  gNormalTex = 0;
+    glDeleteTextures(1, &gDepthTex);    gDepthTex = 0;
+    glDeleteFramebuffers(1, &ssaoFBO);    ssaoFBO = 0;
+    glDeleteTextures(1, &ssaoTex);      ssaoTex = 0;
+    glDeleteFramebuffers(1, &sunEmissiveFBO); sunEmissiveFBO = 0;
+    glDeleteTextures(1, &sunEmissiveTex);    sunEmissiveTex = 0;
+    glDeleteRenderbuffers(1, &sunEmissiveDepth); sunEmissiveDepth = 0;
+    glDeleteFramebuffers(1, &sceneFBO);   sceneFBO = 0;
+    glDeleteTextures(1, &sceneTex);     sceneTex = 0;
+    for (int i = 0; i < 2; i++) {
+        glDeleteFramebuffers(1, &blurFBO[i]);  blurFBO[i] = 0;
+        glDeleteTextures(1, &blurTex[i]);    blurTex[i] = 0;
+    }
+    for (int i = 0; i < g_numLumPasses; i++) {
+        glDeleteFramebuffers(1, &lumFBOs[i]); lumFBOs[i] = 0;
+        glDeleteTextures(1, &lumTex[i]);    lumTex[i] = 0;
+    }
+    g_numLumPasses = 0;
+    glDeleteTextures(1, &avgLumTex);  avgLumTex = 0;
+}
+
+bool recreateFBOs(int w, int h) {
+    deleteFBOs();
+    if (!createGBuffer(w, h))  return false;
+    createSSAOFBO(w, h);
+    createSceneFBO(w, h);
+    createSunEmissiveFBO(w, h);
+    if (!createBlurFBOs(w, h)) return false;
+    // 重建 Luminance 链
+    glGenTextures(1, &avgLumTex);
+    glBindTexture(GL_TEXTURE_2D, avgLumTex);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_R32F, 1, 1, 0, GL_RED, GL_FLOAT, nullptr);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    {
+        int tw = w, th = h;
+        g_numLumPasses = 0;
+        while ((tw > 1 || th > 1) && g_numLumPasses < 12) {
+            int nw = tw > 1 ? tw / 2 : 1;
+            int nh = th > 1 ? th / 2 : 1;
+            glGenTextures(1, &lumTex[g_numLumPasses]);
+            glBindTexture(GL_TEXTURE_2D, lumTex[g_numLumPasses]);
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_R32F, nw, nh, 0, GL_RED, GL_FLOAT, nullptr);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+            glGenFramebuffers(1, &lumFBOs[g_numLumPasses]);
+            glBindFramebuffer(GL_FRAMEBUFFER, lumFBOs[g_numLumPasses]);
+            glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, lumTex[g_numLumPasses], 0);
+            checkGLError("lumFBO recreate");
+            g_numLumPasses++;
+            tw = nw; th = nh;
+        }
+    }
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    g_adaptedLogLum = log(0.05f);  // 重置自适应曝光
+    std::cout << "[DEBUG] FBOs recreated: " << w << "x" << h << std::endl;
     return true;
 }
 
@@ -286,56 +421,6 @@ void main() {
 )";
 // final.frag 改为从文件加载（含 auto-exposure）
 
-// ======================== 坐标轴着色器 ========================
-const char* axisVertSrc = R"(
-#version 330 core
-layout (location = 0) in vec3 aPos;
-layout (location = 1) in vec3 aColor;
-out vec3 vColor;
-out vec3 AxisPos;
-uniform mat4 view, projection;
-void main() {
-    vec4 worldPos = vec4(aPos, 1.0);
-    gl_Position = projection * view * worldPos;
-    AxisPos = worldPos.xyz;
-    vColor = aColor;
-}
-)";
-const char* axisFragSrc = R"(
-#version 330 core
-in vec3 vColor;
-in vec3 AxisPos;
-layout(location = 0) out vec4 gColor;
-layout(location = 1) out vec4 gNormal;
-void main() {
-    gColor = vec4(vColor, 1.0);
-    gNormal = vec4(0.0, 0.0, 0.0, 0.0);
-}
-)";
-
-struct AxisVertex { float x,y,z; float r,g,b; };
-void createAxisVAO(unsigned int& VAO, unsigned int& VBO, float len) {
-    std::vector<AxisVertex> verts = {
-        {0,0,0,1,0,0}, {len,0,0,1,0,0},
-        {0,0,0,0.4f,0,0}, {-len,0,0,0.4f,0,0},
-        {0,0,0,0,1,0}, {0,len,0,0,1,0},
-        {0,0,0,0,0.4f,0}, {0,-len,0,0,0.4f,0},
-        {0,0,0,0,0,1}, {0,0,len,0,0,1},
-        {0,0,0,0,0,0.4f}, {0,0,-len,0,0,0.4f}
-    };
-    glGenVertexArrays(1, &VAO); glGenBuffers(1, &VBO);
-    glBindVertexArray(VAO);
-    glBindBuffer(GL_ARRAY_BUFFER, VBO);
-    glBufferData(GL_ARRAY_BUFFER, verts.size()*sizeof(AxisVertex), verts.data(), GL_STATIC_DRAW);
-    glVertexAttribPointer(0,3,GL_FLOAT,GL_FALSE,sizeof(AxisVertex),(void*)0);
-    glEnableVertexAttribArray(0);
-    glVertexAttribPointer(1,3,GL_FLOAT,GL_FALSE,sizeof(AxisVertex),(void*)(3*sizeof(float)));
-    glEnableVertexAttribArray(1);
-    glBindVertexArray(0);
-    std::cout << "[DEBUG] Axis VAO: " << VAO << std::endl;
-    checkGLError("createAxisVAO");
-}
-
 const char* redVertSrc = R"(
 #version 330 core
 layout (location = 0) in vec3 aPos;
@@ -351,7 +436,17 @@ void main() { FragColor = vec4(1.0, 0.0, 0.0, 1.0); }
 // ======================== main ========================
 int main() {
     Config config;
+    g_pTimeScale = &config.timeScale;
     if (!config.load("config.ini")) return -1;
+
+    // 从配置文件初始化全局设置
+    g_bloomEnabled   = config.bloomEnabled;
+    g_flareEnabled   = config.flareEnabled;
+    g_autoExposure   = config.autoExposure;
+    g_wireframe      = config.wireframe;
+    g_manualExposure = config.manualExposure;
+    g_resolutionIndex = config.resolutionIndex;
+    g_fullscreen     = config.fullscreen;
 
     if (!glfwInit()) return -1;
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
@@ -362,6 +457,7 @@ int main() {
     glfwMakeContextCurrent(window);
     glfwSetFramebufferSizeCallback(window, framebuffer_size_callback);
     glfwSetCursorPosCallback(window, mouse_callback);
+    glfwSetMouseButtonCallback(window, mouse_button_callback);
     glfwSetScrollCallback(window, scroll_callback);
     glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_DISABLED);
 
@@ -374,26 +470,39 @@ int main() {
     glfwGetFramebufferSize(window, &g_screenWidth, &g_screenHeight);
     std::cout << "[DEBUG] Window: " << g_screenWidth << "x" << g_screenHeight << std::endl;
 
-    // 着色器
-    unsigned int sunShader       = createShaderProgramFromFiles("src/shaders/planet.vert", "src/shaders/sun.frag");
-    unsigned int planetShader    = createShaderProgramFromFiles("src/shaders/planet.vert", "src/shaders/planet.frag");
-    unsigned int lensFlareShader = createShaderProgramFromFiles("src/shaders/lensflare.vert", "src/shaders/lensflare.frag");
-    std::string ssaoSrc      = readShaderFile("src/shaders/ssao.frag");
-    std::string compositeSrc = readShaderFile("src/shaders/composite.frag");
+    // 文字渲染器（FreeType）
+    g_textRenderer = new TextRenderer(g_screenWidth, g_screenHeight);
+
+    // 菜单系统（FreeType）
+    g_menu.init(window, g_textRenderer);
+    g_menu.setGlobals(&g_bloomEnabled, &g_flareEnabled, &g_autoExposure,
+                      nullptr, nullptr, &g_manualExposure, &g_wireframe,
+                      &g_resolutionIndex, &g_fullscreen, &g_screenWidth, &g_screenHeight);
+
+    // 应用初始分辨率 & 全屏设置
+    g_menu.applyResolution();
+
+    // 着色器（路径前缀来自 config.shaderPath）
+    const std::string& sp = config.shaderPath;
+
+    unsigned int sunShader       = createShaderProgramFromFiles((sp + "planet.vert").c_str(), (sp + "sun.frag").c_str());
+    unsigned int planetShader    = createShaderProgramFromFiles((sp + "planet.vert").c_str(), (sp + "planet.frag").c_str());
+    unsigned int lensFlareShader = createShaderProgramFromFiles((sp + "lensflare.vert").c_str(), (sp + "lensflare.frag").c_str());
+    std::string ssaoSrc      = readShaderFile((sp + "ssao.frag").c_str());
+    std::string compositeSrc = readShaderFile((sp + "composite.frag").c_str());
     unsigned int ssaoShader      = createShaderProgram(postVertexSrc, ssaoSrc.c_str());
     unsigned int compositeShader = createShaderProgram(postVertexSrc, compositeSrc.c_str());
     unsigned int brightShader    = createShaderProgram(postVertexSrc, brightFragSrc);
     unsigned int blurShader      = createShaderProgram(postVertexSrc, blurFragSrc);
-    std::string finalSrc = readShaderFile("src/shaders/final.frag");
+    std::string finalSrc = readShaderFile((sp + "final.frag").c_str());
     unsigned int finalShader     = createShaderProgram(postVertexSrc, finalSrc.c_str());
-    unsigned int axisShader      = createShaderProgram(axisVertSrc, axisFragSrc);
     unsigned int redShader       = createShaderProgram(redVertSrc, redFragSrc);
-    unsigned int atmosphereShader = createShaderProgramFromFiles("src/shaders/atmosphere.vert", "src/shaders/atmosphere.frag");
-    unsigned int planetGlowShader = createShaderProgramFromFiles("src/shaders/planet_glow.vert", "src/shaders/planet_glow.frag");
+    unsigned int atmosphereShader = createShaderProgramFromFiles((sp + "atmosphere.vert").c_str(), (sp + "atmosphere.frag").c_str());
+    unsigned int planetGlowShader = createShaderProgramFromFiles((sp + "planet_glow.vert").c_str(), (sp + "planet_glow.frag").c_str());
 
 
     if (!sunShader || !planetShader || !lensFlareShader || !ssaoShader || !compositeShader ||
-        !brightShader || !blurShader || !finalShader || !axisShader || !redShader || !atmosphereShader ||
+        !brightShader || !blurShader || !finalShader || !redShader || !atmosphereShader ||
         !planetGlowShader) {
         std::cerr << "Shader compilation failed!" << std::endl;
         return -1;
@@ -403,6 +512,7 @@ int main() {
     if (!createGBuffer(g_screenWidth, g_screenHeight)) return -1;
     createSSAOFBO(g_screenWidth, g_screenHeight);
     createSceneFBO(g_screenWidth, g_screenHeight);
+    createSunEmissiveFBO(g_screenWidth, g_screenHeight);
     if (!createBlurFBOs(g_screenWidth, g_screenHeight)) return -1;
 
     // ======================= Luminance FBO chain (auto-exposure) =======================
@@ -439,7 +549,7 @@ int main() {
     std::cout << "[DEBUG] Luminance FBO chain: " << g_numLumPasses << " passes" << std::endl;
 
     // Luminance shader
-    std::string lumFragSrc = readShaderFile("src/shaders/luminance.frag");
+    std::string lumFragSrc = readShaderFile((sp + "luminance.frag").c_str());
     lumShader = createShaderProgram(postVertexSrc, lumFragSrc.c_str());
     if (!lumShader) { std::cerr << "Luminance shader failed!" << std::endl; return -1; }
 
@@ -447,7 +557,8 @@ int main() {
     std::cout << "[DEBUG] LOD indices: "
               << sphereLOD.levels[0].indexCount << " / "
               << sphereLOD.levels[1].indexCount << " / "
-              << sphereLOD.levels[2].indexCount << std::endl;
+              << sphereLOD.levels[2].indexCount << " / "
+              << sphereLOD.levels[3].indexCount << std::endl;
 
     Camera camera(config.cameraPos, config.cameraYaw, config.cameraPitch, config.cameraRoll,
                   config.cameraFov, config.cameraSpeed, config.cameraSensitivity);
@@ -456,17 +567,81 @@ int main() {
     std::vector<Planet> planets;
     for (auto& p : config.planets) {
         unsigned int tex = loadTexture(p.texturePath, p.color);
-        bool atm = (p.name == "earth");  // 地球有大气层
+        bool atm = (p.name == "earth" || p.name == "venus" || p.name == "mars");
         planets.emplace_back(p.name, p.orbitRadius, p.orbitPeriod, p.rotationPeriod,
                              p.size, tex, p.color, p.roughness, p.metallic, atm);
     }
+
+    // 计算 J2000.0 (JD 2451545.0) 到当前时刻的天数
+    {
+        time_t now = time(nullptr);
+        double jd = now / 86400.0 + 2440587.5;        // Unix epoch → JD
+        double daysSinceJ2000 = jd - 2451545.0; // JD → J2000.0 offset
+        Planet::setEpochDays(daysSinceJ2000);
+        std::cout << "[DEBUG] Days since J2000.0: " << daysSinceJ2000 << std::endl;
+    }
+
+    // 设置每颗行星的轨道力学参数
+    for (size_t i = 0; i < config.planets.size() && i < planets.size(); i++) {
+        auto& pc = config.planets[i];
+        planets[i].setOrbitalElements(
+            pc.inclination, pc.eccentricity,
+            pc.longitudeAscendingNode, pc.argumentOfPeriapsis,
+            pc.meanAnomalyAtEpoch, pc.axialTilt);
+    }
+
     std::cout << "[DEBUG] Planets: " << planets.size() << std::endl;
+
+    // ========== 卫星 (从 config.ini 读取) ==========
+    auto findPlanet = [&](const std::string& name) -> Planet* {
+        for (auto& p : planets) if (p.getName() == name) return &p;
+        return nullptr;
+    };
+
+    for (const auto& mc : config.moons) {
+        Planet* parent = findPlanet(mc.parent);
+        if (!parent) {
+            std::cerr << "WARNING: Moon '" << mc.name << "' parent '" << mc.parent << "' not found" << std::endl;
+            continue;
+        }
+        unsigned int tex = loadTexture(mc.texturePath, mc.color);
+        parent->addMoon(mc.name, mc.orbitRadius, mc.orbitPeriod,
+                        mc.meanAnomalyAtEpoch, mc.size, mc.color, tex);
+    }
+
+    int totalMoons = 0;
+    for (auto& p : planets) totalMoons += (int)p.getMoons().size();
+    std::cout << "[DEBUG] Moons: " << totalMoons << std::endl;
+
+    // 卫星光照用 fallback 白色纹理
+    unsigned int whiteTex;
+    {
+        unsigned char white[4] = {255, 255, 255, 255};
+        glGenTextures(1, &whiteTex);
+        glBindTexture(GL_TEXTURE_2D, whiteTex);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 1, 1, 0, GL_RGBA, GL_UNSIGNED_BYTE, white);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
+    }
+
+    // 点精灵 VAO (用于 sub-pixel 天体)
+    {
+        glGenVertexArrays(1, &pointVAO);
+        glGenBuffers(1, &pointVBO);
+        float pointVert[3] = {0.0f, 0.0f, 0.0f};
+        glBindVertexArray(pointVAO);
+        glBindBuffer(GL_ARRAY_BUFFER, pointVBO);
+        glBufferData(GL_ARRAY_BUFFER, sizeof(pointVert), pointVert, GL_STATIC_DRAW);
+        glEnableVertexAttribArray(0);
+        glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 3 * sizeof(float), (void*)0);
+        glBindVertexArray(0);
+    }
+
     glm::vec3 sunPos(0.0f);
     float sunRadius = 15.0f;
     if (!planets.empty()) { sunPos = planets[0].getPosition(); sunRadius = planets[0].getSize(); }
-
-    unsigned int axisVAO, axisVBO;
-    createAxisVAO(axisVAO, axisVBO, 40000.0f);
 
     // SSAO kernel (CPU生成)
     std::uniform_real_distribution<float> rngDist(0.0f, 1.0f);
@@ -482,28 +657,53 @@ int main() {
         ssaoKernel.push_back(sample);
     }
 
-    bool bPressedLast = false, nPressedLast = false, tPressedLast = false;
-    bool lPressedLast = false, plusPressedLast = false, minusPressedLast = false;
-    bool zPressedLast = false, gPressedLast = false, vPressedLast = false, xPressedLast = false;
-
-
     float lightIntensity = 5000.0f;   // 线性衰减 1/dist，地球 ≈ 5.0
-    float flareIntensity = 1.2f;
+    float flareIntensity = 0.6f;
     float ssaoStrength = 0.8f;
     float coronaIntensity = 0.5f;
     float kSunRadius = 15.0f;  // 与 config.ini 同步，用于角度计算
+
+    bool nPressedLast = false, tPressedLast = false;
+    bool plusPressedLast = false, minusPressedLast = false;
+    bool gPressedLast = false, xPressedLast = false;
+    bool escapePressedLast = false;
+
+    float fpsAccum = 0.0f;
+    int   fpsCount = 0;
+
+    g_lastFrame = (float)glfwGetTime();  // 避免首帧 deltaTime 异常大
 
     while (!glfwWindowShouldClose(window)) {
         float currentTime = glfwGetTime();
         g_deltaTime = currentTime - g_lastFrame;
         g_lastFrame = currentTime;
 
-        if (glfwGetKey(window, GLFW_KEY_ESCAPE) == GLFW_PRESS)
-            glfwSetWindowShouldClose(window, true);
+        fpsCount++;
+        fpsAccum += g_deltaTime;
+        if (fpsAccum >= 0.5f) {
+            int fps = (int)(fpsCount / fpsAccum + 0.5f);
+            g_lastFps = fps;
+            char title[64];
+            snprintf(title, sizeof(title), "Solar | FPS: %d", fps);
+            glfwSetWindowTitle(window, title);
+            fpsAccum = 0.0f;
+            fpsCount = 0;
+        }
 
-        if (glfwGetKey(window, GLFW_KEY_B) == GLFW_PRESS && !bPressedLast) {
-            g_bloomEnabled = !g_bloomEnabled;
-            std::cout << "[INFO] Bloom: " << (g_bloomEnabled ? "ON" : "OFF") << std::endl;
+        // FBO 重建（分辨率变更后）
+        if (g_fboDirty) {
+            if (recreateFBOs(g_screenWidth, g_screenHeight)) {
+                g_fboDirty = false;
+            } else {
+                std::cerr << "[ERROR] FBO recreation failed!" << std::endl;
+            }
+        }
+
+        if (glfwGetKey(window, GLFW_KEY_ESCAPE) == GLFW_PRESS && !escapePressedLast) {
+            if (g_menu.isGameplay())
+                g_menu.togglePause();
+            else
+                g_menu.back();
         }
         if (glfwGetKey(window, GLFW_KEY_N) == GLFW_PRESS && !nPressedLast) {
             g_directOutput = !g_directOutput;
@@ -512,10 +712,6 @@ int main() {
         if (glfwGetKey(window, GLFW_KEY_T) == GLFW_PRESS && !tPressedLast) {
             g_testRedSphere = !g_testRedSphere;
             std::cout << "[INFO] Test red sphere: " << (g_testRedSphere ? "ON" : "OFF") << std::endl;
-        }
-        if (glfwGetKey(window, GLFW_KEY_L) == GLFW_PRESS && !lPressedLast) {
-            g_flareEnabled = !g_flareEnabled;
-            std::cout << "[INFO] Lens flare: " << (g_flareEnabled ? "ON" : "OFF") << std::endl;
         }
         // 手动曝光补偿
         if (glfwGetKey(window, GLFW_KEY_KP_ADD) == GLFW_PRESS && !plusPressedLast) {
@@ -526,59 +722,63 @@ int main() {
             g_manualExposure -= 0.5f;
             std::cout << "[INFO] Manual exposure: " << g_manualExposure << std::endl;
         }
-        // Z 键切换自动/固定曝光
-        if (glfwGetKey(window, GLFW_KEY_Z) == GLFW_PRESS && !zPressedLast) {
-            g_autoExposure = !g_autoExposure;
-            std::cout << "[INFO] Auto exposure: " << (g_autoExposure ? "ON" : "OFF (fixed)") << std::endl;
-        }
         if (glfwGetKey(window, GLFW_KEY_G) == GLFW_PRESS && !gPressedLast) {
             g_debugGBuffer = !g_debugGBuffer;
             std::cout << "[INFO] G-Buffer direct: " << (g_debugGBuffer ? "ON" : "OFF") << std::endl;
-        }
-        if (glfwGetKey(window, GLFW_KEY_V) == GLFW_PRESS && !vPressedLast) {
-            g_wireframe = !g_wireframe;
-            std::cout << "[INFO] Wireframe: " << (g_wireframe ? "ON" : "OFF") << std::endl;
         }
         if (glfwGetKey(window, GLFW_KEY_X) == GLFW_PRESS && !xPressedLast) {
             g_extremeDiagnose = !g_extremeDiagnose;
             std::cout << "[INFO] Extreme diagnose: " << (g_extremeDiagnose ? "ON" : "OFF") << std::endl;
         }
-        bPressedLast = (glfwGetKey(window, GLFW_KEY_B) == GLFW_PRESS);
         nPressedLast = (glfwGetKey(window, GLFW_KEY_N) == GLFW_PRESS);
         tPressedLast = (glfwGetKey(window, GLFW_KEY_T) == GLFW_PRESS);
-        lPressedLast = (glfwGetKey(window, GLFW_KEY_L) == GLFW_PRESS);
-        zPressedLast = (glfwGetKey(window, GLFW_KEY_Z) == GLFW_PRESS);
         gPressedLast = (glfwGetKey(window, GLFW_KEY_G) == GLFW_PRESS);
-        vPressedLast = (glfwGetKey(window, GLFW_KEY_V) == GLFW_PRESS);
         xPressedLast = (glfwGetKey(window, GLFW_KEY_X) == GLFW_PRESS);
         plusPressedLast = (glfwGetKey(window, GLFW_KEY_KP_ADD) == GLFW_PRESS);
         minusPressedLast = (glfwGetKey(window, GLFW_KEY_KP_SUBTRACT) == GLFW_PRESS);
+        escapePressedLast = (glfwGetKey(window, GLFW_KEY_ESCAPE) == GLFW_PRESS);
 
-        camera.processKeyboard(GLFW_KEY_W, glfwGetKey(window, GLFW_KEY_W), g_deltaTime);
-        camera.processKeyboard(GLFW_KEY_A, glfwGetKey(window, GLFW_KEY_A), g_deltaTime);
-        camera.processKeyboard(GLFW_KEY_S, glfwGetKey(window, GLFW_KEY_S), g_deltaTime);
-        camera.processKeyboard(GLFW_KEY_D, glfwGetKey(window, GLFW_KEY_D), g_deltaTime);
-        camera.processKeyboard(GLFW_KEY_Q, glfwGetKey(window, GLFW_KEY_Q), g_deltaTime);
-        camera.processKeyboard(GLFW_KEY_E, glfwGetKey(window, GLFW_KEY_E), g_deltaTime);
-        camera.processKeyboard(GLFW_KEY_R, glfwGetKey(window, GLFW_KEY_R), g_deltaTime);
-        camera.processKeyboard(GLFW_KEY_F, glfwGetKey(window, GLFW_KEY_F), g_deltaTime);
-        camera.update(g_deltaTime);
+        if (g_menu.isGameplay()) {
+            camera.processKeyboard(GLFW_KEY_W, glfwGetKey(window, GLFW_KEY_W), g_deltaTime);
+            camera.processKeyboard(GLFW_KEY_A, glfwGetKey(window, GLFW_KEY_A), g_deltaTime);
+            camera.processKeyboard(GLFW_KEY_S, glfwGetKey(window, GLFW_KEY_S), g_deltaTime);
+            camera.processKeyboard(GLFW_KEY_D, glfwGetKey(window, GLFW_KEY_D), g_deltaTime);
+            camera.processKeyboard(GLFW_KEY_Q, glfwGetKey(window, GLFW_KEY_Q), g_deltaTime);
+            camera.processKeyboard(GLFW_KEY_E, glfwGetKey(window, GLFW_KEY_E), g_deltaTime);
+            camera.processKeyboard(GLFW_KEY_R, glfwGetKey(window, GLFW_KEY_R), g_deltaTime);
+            camera.processKeyboard(GLFW_KEY_F, glfwGetKey(window, GLFW_KEY_F), g_deltaTime);
+            camera.update(g_deltaTime);
+        }
 
-        float simTime = (float)glfwGetTime() * config.timeScale;
-        for (auto& p : planets) p.update(simTime);
+        // 累积式时间推进：simTime += deltaTime * timeScale，改流速不影响位置
+        g_simTime += g_deltaTime * config.timeScale;
+        for (auto& p : planets) p.update(g_simTime);
 
-        glm::vec3 viewPos = camera.getPosition();
+        glm::dvec3 viewPosD = camera.getPosition();
+        glm::vec3 viewPos = glm::vec3(viewPosD);
         glm::mat4 view = camera.getViewMatrix();
+        glm::mat4 viewRot = glm::mat4(glm::mat3(view));  // 仅旋转部分，配合相对坐标 model 使用
 
-        // dynamic near plane: adapt to camera proximity to nearest planet surface
-        float dynamicNear = 0.1f;
+        // dynamic near plane: 近平面 = 到最近表面距离 × 0.5，确保永远小于表面距离
+        // 时间平滑防止深度编码逐帧跳变导致 SSAO/大气抖动
+        float targetNear = 0.1f;
         for (auto& p : planets) {
             float distToSurface = glm::length(p.getPosition() - viewPos) - p.getSize();
             if (distToSurface < 0.0f) distToSurface = 0.001f;
             float nearForThis = distToSurface * 0.5f;
-            if (nearForThis < dynamicNear) dynamicNear = nearForThis;
+            if (nearForThis < targetNear) targetNear = nearForThis;
+            for (auto& m : p.getMoons()) {
+                float moonDistToSurface = glm::length(m.worldPosition - viewPos) - m.size;
+                if (moonDistToSurface < 0.0f) moonDistToSurface = 0.001f;
+                float moonNear = moonDistToSurface * 0.5f;
+                if (moonNear < targetNear) targetNear = moonNear;
+            }
         }
-        if (dynamicNear < 0.001f) dynamicNear = 0.001f;
+        if (targetNear < 0.001f) targetNear = 0.001f;
+        static float smoothedNear = 0.1f;
+        float blend = glm::clamp(g_deltaTime * 3.0f, 0.0f, 1.0f);  // ~0.3s 适应
+        smoothedNear += (targetNear - smoothedNear) * blend;
+        float dynamicNear = smoothedNear;
         glm::mat4 proj = glm::perspective(glm::radians(camera.getFov()),
                                           (float)g_screenWidth / g_screenHeight,
                                           dynamicNear, 80000.0f);
@@ -598,7 +798,7 @@ int main() {
             auto lod = sphereLOD.levels[0];
             for (auto& p : planets) {
                 if (p.isSun()) {
-                    p.drawEmissive(sunShader, lod.VAO, lod.indexCount, view, proj, viewPos, 10.0f);
+                    p.drawEmissive(sunShader, lod.VAO, lod.indexCount, view, viewRot, proj, viewPos, 10.0f);
                 }
             }
         }
@@ -611,10 +811,83 @@ int main() {
             if (!p.isSun()) {
                 float dist = glm::length(p.getPosition() - viewPos);
                 auto lod = selectLOD(sphereLOD, dist, p.getSize(), config.cameraFov, g_screenHeight);
-                p.draw(planetShader, lod.VAO, lod.indexCount, view, proj, viewPos, lightIntensity, sunRadius);
+                p.draw(planetShader, lod.VAO, lod.indexCount, view, viewRot, proj, viewPos, lightIntensity, sunRadius);
             }
         }
         checkGLError("planet draw");
+
+        // ===== 卫星渲染 (G-Buffer, PBR光照同行星) =====
+        glUseProgram(planetShader);
+        glUniformMatrix4fv(glGetUniformLocation(planetShader, "view"), 1, GL_FALSE, glm::value_ptr(view));
+        glUniformMatrix4fv(glGetUniformLocation(planetShader, "viewRot"), 1, GL_FALSE, glm::value_ptr(viewRot));
+        glUniformMatrix4fv(glGetUniformLocation(planetShader, "projection"), 1, GL_FALSE, glm::value_ptr(proj));
+        glUniform3fv(glGetUniformLocation(planetShader, "viewPos"), 1, glm::value_ptr(viewPos));
+        glUniform1f(glGetUniformLocation(planetShader, "lightIntensity"), lightIntensity);
+        glUniform1f(glGetUniformLocation(planetShader, "sunRadius"), sunRadius);
+        glUniform1f(glGetUniformLocation(planetShader, "roughness"), 0.8f);
+        glUniform1f(glGetUniformLocation(planetShader, "metallic"), 0.0f);
+        glUniform1i(glGetUniformLocation(planetShader, "hasAtmosphere"), 0);
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, whiteTex);
+        glUniform1i(glGetUniformLocation(planetShader, "textureSampler"), 0);
+        unsigned int lastMoonTex = whiteTex;
+        for (auto& p : planets) {
+            for (auto& m : p.getMoons()) {
+                // 卫星纹理绑定
+                unsigned int moonTex = m.textureID ? m.textureID : whiteTex;
+                if (moonTex != lastMoonTex) {
+                    glBindTexture(GL_TEXTURE_2D, moonTex);
+                    lastMoonTex = moonTex;
+                }
+                glUniform3fv(glGetUniformLocation(planetShader, "uBaseColor"), 1,
+                             m.textureID ? glm::value_ptr(glm::vec3(1.0f)) : glm::value_ptr(m.color));
+                // 行星遮挡投影检测 (ray-sphere)
+                float shadowFactor = 1.0f;
+                {
+                    glm::vec3 toSun = sunPos - m.worldPosition;
+                    float distToSun = glm::length(toSun);
+                    glm::vec3 sunDir = toSun / distToSun;
+                    for (auto& occluder : planets) {
+                        if (occluder.isSun()) continue;
+                        glm::vec3 toPlanet = occluder.getPosition() - m.worldPosition;
+                        float t = glm::dot(toPlanet, sunDir);
+                        if (t < 0.0f || t > distToSun) continue;  // 在卫星后面或太阳后面
+                        float d2 = glm::dot(toPlanet, toPlanet) - t * t;
+                        float r = occluder.getSize();
+                        if (d2 < r * r) { shadowFactor = 0.0f; break; }
+                    }
+                }
+                // 判断是否为 sub-pixel：屏幕空间半径 < 0.5 像素
+                float dist = glm::length(m.worldPosition - viewPos);
+                float angularRadius = atan(m.size / dist);
+                float fovy = glm::radians(config.cameraFov);
+                float pixelRadius = angularRadius * g_screenHeight / (2.0f * tan(fovy / 2.0f));
+
+                glUniform1f(glGetUniformLocation(planetShader, "uShadowFactor"), shadowFactor);
+                if (pixelRadius < 0.5f && !g_wireframe) {
+                    // Sub-pixel：用 GL_POINTS 渲染为 1 像素点（线框模式下无意义，走正常球体）
+                    glPointSize(1.0f);
+                    glm::mat4 model = glm::translate(glm::mat4(1.0f), m.worldPosition);
+                    glUniformMatrix4fv(glGetUniformLocation(planetShader, "model"), 1, GL_FALSE, glm::value_ptr(model));
+                    glBindVertexArray(pointVAO);
+                    glDrawArrays(GL_POINTS, 0, 1);
+                } else {
+                    // 正常球体渲染 — 相机相对坐标避免 float 精度丢失
+                    auto lod = selectLOD(sphereLOD, dist, m.size, config.cameraFov, g_screenHeight);
+                    // 对很小的天体（size < 0.01），强制用最高精度
+                    if (m.size < 0.01f) {
+                        lod = { sphereLOD.levels[0].VAO, sphereLOD.levels[0].indexCount };
+                    }
+                    glm::mat4 model = glm::translate(glm::mat4(1.0f), m.worldPosition - viewPos);
+                    model = glm::scale(model, glm::vec3(m.size));
+                    glUniformMatrix4fv(glGetUniformLocation(planetShader, "model"), 1, GL_FALSE, glm::value_ptr(model));
+                    glUniform3fv(glGetUniformLocation(planetShader, "cameraPos"), 1, glm::value_ptr(viewPos));
+                    glBindVertexArray(lod.VAO);
+                    glDrawElements(GL_TRIANGLES, lod.indexCount, GL_UNSIGNED_INT, 0);
+                }
+            }
+        }
+        glBindVertexArray(0);
         if (g_wireframe) {
             glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
         }
@@ -627,18 +900,52 @@ int main() {
         for (auto& p : planets) {
             if (p.hasAtmosphere()) {
                 float pSize = p.getSize();
-                float atmosR = pSize * 1.15f;
-                glm::mat4 atmosM = glm::translate(glm::mat4(1.0f), p.getPosition());
+                // Per-planet atmosphere shell size
+                float atmosScale = 1.15f;
+                if (p.getName() == "venus")  atmosScale = 1.20f;
+                if (p.getName() == "mars")   atmosScale = 1.10f;
+                float atmosR = pSize * atmosScale;
+                glm::mat4 atmosM = glm::translate(glm::mat4(1.0f), p.getPosition() - viewPos);
                 atmosM = glm::scale(atmosM, glm::vec3(atmosR));
                 glUniformMatrix4fv(glGetUniformLocation(atmosphereShader, "model"), 1, GL_FALSE, glm::value_ptr(atmosM));
-                glUniformMatrix4fv(glGetUniformLocation(atmosphereShader, "view"), 1, GL_FALSE, glm::value_ptr(view));
+                glUniformMatrix4fv(glGetUniformLocation(atmosphereShader, "viewRot"), 1, GL_FALSE, glm::value_ptr(viewRot));
                 glUniformMatrix4fv(glGetUniformLocation(atmosphereShader, "projection"), 1, GL_FALSE, glm::value_ptr(proj));
+                glUniform3fv(glGetUniformLocation(atmosphereShader, "cameraPos"), 1, glm::value_ptr(viewPos));
                 glUniform3fv(glGetUniformLocation(atmosphereShader, "planetCenter"), 1, glm::value_ptr(p.getPosition()));
                 glUniform1f(glGetUniformLocation(atmosphereShader, "planetRadius"), pSize);
                 glUniform1f(glGetUniformLocation(atmosphereShader, "atmosphereRadius"), atmosR);
                 glm::vec3 sunDN = glm::normalize(sunPos - p.getPosition());
                 glUniform3fv(glGetUniformLocation(atmosphereShader, "sunDir"), 1, glm::value_ptr(sunDN));
-                glUniform3fv(glGetUniformLocation(atmosphereShader, "cameraPos"), 1, glm::value_ptr(viewPos));
+                // Per-planet atmosphere scattering parameters
+                glm::vec3 rayleighCol, mieCol;
+                float densityFO, rayleighStr, mieStr;
+                if (p.getName() == "venus") {
+                    // Venus: thick CO2, whitish-yellow haze, Mie dominant
+                    rayleighCol = glm::vec3(0.5f, 0.6f, 0.7f);
+                    mieCol      = glm::vec3(1.0f, 0.95f, 0.8f);
+                    densityFO   = 0.6f;
+                    rayleighStr = 0.15f;
+                    mieStr      = 0.6f;
+                } else if (p.getName() == "mars") {
+                    // Mars: thin CO2 + dust, reddish-orange limb
+                    rayleighCol = glm::vec3(0.3f, 0.5f, 1.0f);
+                    mieCol      = glm::vec3(1.0f, 0.5f, 0.3f);
+                    densityFO   = 1.5f;
+                    rayleighStr = 0.35f;
+                    mieStr      = 0.5f;
+                } else {
+                    // Earth: default blue Rayleigh + white Mie
+                    rayleighCol = glm::vec3(0.25f, 0.55f, 1.0f);
+                    mieCol      = glm::vec3(1.0f, 0.90f, 0.65f);
+                    densityFO   = 1.0f;
+                    rayleighStr = 0.7f;
+                    mieStr      = 0.35f;
+                }
+                glUniform3fv(glGetUniformLocation(atmosphereShader, "uRayleighColor"),  1, glm::value_ptr(rayleighCol));
+                glUniform3fv(glGetUniformLocation(atmosphereShader, "uMieColor"),      1, glm::value_ptr(mieCol));
+                glUniform1f(glGetUniformLocation(atmosphereShader, "uDensityFalloff"),  densityFO);
+                glUniform1f(glGetUniformLocation(atmosphereShader, "uRayleighStrength"), rayleighStr);
+                glUniform1f(glGetUniformLocation(atmosphereShader, "uMieStrength"),     mieStr);
                 float dist = glm::length(p.getPosition() - viewPos);
                 auto lod = selectLOD(sphereLOD, dist, atmosR, config.cameraFov, g_screenHeight);
                 glBindVertexArray(lod.VAO);
@@ -648,18 +955,6 @@ int main() {
         glDepthMask(GL_TRUE);
         glDisable(GL_BLEND);
         checkGLError("atmosphere pass");
-
-        // ===== 坐标轴 (写入 G-Buffer, 深度测试开启, 被天体自然遮挡) =====
-        glEnable(GL_DEPTH_TEST);
-        glDepthFunc(GL_LESS);
-        glDepthMask(GL_TRUE);
-        glDrawBuffers(2, gBufDraw);
-        glUseProgram(axisShader);
-        glUniformMatrix4fv(glGetUniformLocation(axisShader, "view"), 1, GL_FALSE, glm::value_ptr(view));
-        glUniformMatrix4fv(glGetUniformLocation(axisShader, "projection"), 1, GL_FALSE, glm::value_ptr(proj));
-        glBindVertexArray(axisVAO);
-        glDrawArrays(GL_LINES, 0, 12);
-        glBindVertexArray(0);
 
         if (g_testRedSphere) {
             glUseProgram(redShader);
@@ -701,6 +996,37 @@ int main() {
         }
 
         // ================================================================
+        // Pass 1.5: Sun Emissive → 独立 FBO（深度测试隔离行星遮挡）
+        // ================================================================
+        {
+            // Blit G-buffer 深度到 sunEmissiveFBO
+            glBindFramebuffer(GL_READ_FRAMEBUFFER, gBufferFBO);
+            glBindFramebuffer(GL_DRAW_FRAMEBUFFER, sunEmissiveFBO);
+            glBlitFramebuffer(0, 0, g_screenWidth, g_screenHeight,
+                              0, 0, g_screenWidth, g_screenHeight,
+                              GL_DEPTH_BUFFER_BIT, GL_NEAREST);
+            glBindFramebuffer(GL_FRAMEBUFFER, sunEmissiveFBO);
+            glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+            glClear(GL_COLOR_BUFFER_BIT);
+            // 深度测试启用，深度写入禁（用 G-buffer 已有的深度）
+            glEnable(GL_DEPTH_TEST);
+            glDepthFunc(GL_LEQUAL);
+            glDepthMask(GL_FALSE);
+            // 渲染太阳 emissive — 被行星遮挡的像素自动不写入
+            {
+                auto lod = sphereLOD.levels[0];
+                for (auto& p : planets) {
+                    if (p.isSun()) {
+                        p.drawEmissive(sunShader, lod.VAO, lod.indexCount, view, viewRot, proj, viewPos, 10.0f);
+                    }
+                }
+            }
+            glDepthMask(GL_TRUE);
+            glBindFramebuffer(GL_FRAMEBUFFER, 0);
+            checkGLError("sun emissive FBO");
+        }
+
+        // ================================================================
         // Pass 2: SSAO
         // ================================================================
         glBindFramebuffer(GL_FRAMEBUFFER, ssaoFBO);
@@ -726,6 +1052,7 @@ int main() {
             std::string name = "samples[" + std::to_string(i) + "]";
             glUniform3fv(glGetUniformLocation(ssaoShader, name.c_str()), 1, glm::value_ptr(ssaoKernel[i]));
         }
+        glUniform1f(glGetUniformLocation(ssaoShader, "uTime"), currentTime);
         glBindVertexArray(quadVAO);
         glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
         checkGLError("SSAO pass");
@@ -752,6 +1079,88 @@ int main() {
             if (sunUVRadius < 0.0005f) sunUVRadius = 0.0005f;
         }
 
+        // === 太阳 disc 可见中心 & 面积比例 ===
+        // 屏幕裁剪后的可见矩形（UV空间 [0,1]）
+        float discLeft   = glm::clamp(sunScreenX - sunUVRadius, 0.0f, 1.0f);
+        float discRight  = glm::clamp(sunScreenX + sunUVRadius, 0.0f, 1.0f);
+        float discBottom = glm::clamp(sunScreenY - sunUVRadius, 0.0f, 1.0f);
+        float discTop    = glm::clamp(sunScreenY + sunUVRadius, 0.0f, 1.0f);
+
+        // 可见中心：太阳 disc 屏幕内部分的几何中心
+        float flareCenterX = (discLeft + discRight) * 0.5f;
+        float flareCenterY = (discBottom + discTop) * 0.5f;
+
+        // 屏幕可见比例（近似：可见矩形面积 / 外接正方形面积）
+        float visWidth  = discRight  - discLeft;
+        float visHeight = discTop - discBottom;
+        float screenFrac = (sunUVRadius > 0.0001f)
+            ? glm::clamp((visWidth * visHeight) / (sunUVRadius * sunUVRadius * 4.0f), 0.0f, 1.0f)
+            : 0.0f;
+
+        // 行星遮挡面积比例（圆-圆重叠精确计算）
+        float sunDiscVisible = sunDiskOnScreen ? 1.0f : 0.0f;
+        if (sunDiscVisible > 0.01f && sunUVRadius > 0.0f) {
+            float sunArea = glm::pi<float>() * sunUVRadius * sunUVRadius;
+            float totalOccluded = 0.0f;
+            struct { float uvX, uvY, uvR; } discs[64];
+            int discCount = 0;
+            float fovY = glm::radians(camera.getFov());
+            for (auto& p : planets) {
+                if (p.isSun() || discCount >= 64) continue;
+                glm::vec3 pp = p.getPosition();
+                glm::vec3 ts = sunPos - pp;
+                glm::vec3 tc = viewPos - pp;
+                if (glm::dot(ts, tc) >= 0.0f) continue;
+                glm::vec4 cl = proj * view * glm::vec4(pp, 1.0f);
+                if (cl.w <= 0.0f) continue;
+                glm::vec3 nd = glm::vec3(cl) / cl.w;
+                float dp = glm::length(pp - viewPos);
+                float bs = p.hasAtmosphere() ? p.getSize() * 1.15f : p.getSize();
+                float ar = glm::atan(bs / dp);
+                float nr = glm::tan(ar) / glm::tan(fovY * 0.5f);
+                discs[discCount++] = {(nd.x + 1.0f) * 0.5f, (nd.y + 1.0f) * 0.5f, nr * 0.5f};
+            }
+            for (auto& p : planets) {
+                for (auto& m : p.getMoons()) {
+                    if (discCount >= 64) break;
+                    glm::vec3 mp = m.worldPosition;
+                    glm::vec3 ts = sunPos - mp;
+                    glm::vec3 tc = viewPos - mp;
+                    if (glm::dot(ts, tc) >= 0.0f) continue;
+                    glm::vec4 cl = proj * view * glm::vec4(mp, 1.0f);
+                    if (cl.w <= 0.0f) continue;
+                    glm::vec3 nd = glm::vec3(cl) / cl.w;
+                    float dm = glm::length(mp - viewPos);
+                    float ar = glm::atan(m.size / dm);
+                    float nr = glm::tan(ar) / glm::tan(fovY * 0.5f);
+                    discs[discCount++] = {(nd.x + 1.0f) * 0.5f, (nd.y + 1.0f) * 0.5f, nr * 0.5f};
+                }
+            }
+            float aspect = (float)g_screenWidth / g_screenHeight;
+            for (int i = 0; i < discCount; i++) {
+                float dx = (discs[i].uvX - sunScreenX) * aspect;
+                float dy = discs[i].uvY - sunScreenY;
+                float d = sqrt(dx * dx + dy * dy);
+                float rP = discs[i].uvR;
+                float rS = sunUVRadius;
+                if (d >= rS + rP) continue;
+                if (d <= fabs(rS - rP)) {
+                    if (rP >= rS) { totalOccluded = sunArea; break; }
+                    totalOccluded += glm::pi<float>() * rP * rP;
+                    continue;
+                }
+                float d1 = (rS * rS - rP * rP + d * d) / (2.0f * d);
+                float d2 = d - d1;
+                float ol = rS * rS * (float)acos(d1 / rS) - d1 * sqrt(rS * rS - d1 * d1)
+                         + rP * rP * (float)acos(d2 / rP) - d2 * sqrt(rP * rP - d2 * d2);
+                totalOccluded += ol;
+            }
+            sunDiscVisible = glm::clamp(1.0f - totalOccluded / sunArea, 0.0f, 1.0f);
+        }
+
+        // 综合可见比例：屏幕裁剪 × 行星遮挡
+        float sunVisibleCombined = sunDiscVisible * screenFrac;
+
         glBindFramebuffer(GL_FRAMEBUFFER, sceneFBO);
         glClear(GL_COLOR_BUFFER_BIT);
         glUseProgram(compositeShader);
@@ -763,56 +1172,64 @@ int main() {
         glBindTexture(GL_TEXTURE_2D, ssaoTex);
         glUniform1i(glGetUniformLocation(compositeShader, "ssaoTex"), 1);
 
-        float actualCoronaIntensity = coronaIntensity;
-        if (sunClip.w > 0.0f) {
-            // 太阳靠近屏幕边缘时平滑淡出，避免硬切
-            glm::vec3 ndc = glm::vec3(sunClip) / sunClip.w;
-            float edgeDist = 1.0f;
-            edgeDist = std::min(edgeDist, glm::smoothstep(0.0f, 0.3f, ndc.x + 1.0f));
-            edgeDist = std::min(edgeDist, glm::smoothstep(0.0f, 0.3f, 1.0f - ndc.x));
-            edgeDist = std::min(edgeDist, glm::smoothstep(0.0f, 0.3f, ndc.y + 1.0f));
-            edgeDist = std::min(edgeDist, glm::smoothstep(0.0f, 0.3f, 1.0f - ndc.y));
-            actualCoronaIntensity *= edgeDist;
-        } else {
-            actualCoronaIntensity = 0.0f;
-        }
+        // 日冕强度：按太阳 disc 屏幕内可见比例缩放（基于可见中心，不是太阳中心NDC）
+        float actualCoronaIntensity = coronaIntensity * screenFrac;
         glUniform1f(glGetUniformLocation(compositeShader, "uSSAOStrength"), ssaoStrength);
         glUniform2f(glGetUniformLocation(compositeShader, "uSunPos"), sunScreenX, sunScreenY);
         glUniform1f(glGetUniformLocation(compositeShader, "uSunRadius"), sunUVRadius);
         glUniform1f(glGetUniformLocation(compositeShader, "uIntensity"), actualCoronaIntensity);
         glUniform1f(glGetUniformLocation(compositeShader, "uAspectRatio"), (float)g_screenWidth / g_screenHeight);
         glUniform3f(glGetUniformLocation(compositeShader, "uSunColor"), 1.0f, 0.85f, 0.2f);
+        glUniform1f(glGetUniformLocation(compositeShader, "uSunDiscVisible"), sunDiscVisible);
 
-        // 传入凌日行星数据
+        // 传入遮挡行星数据（所有屏上可见行星，用于 corona 几何遮挡 + rim glow）
         {
             float fovY = glm::radians(camera.getFov());
             int eclipseCount = 0;
             GLint countLoc = glGetUniformLocation(compositeShader, "uEclipseCount");
             GLint centerLoc = glGetUniformLocation(compositeShader, "uEclipseCenter[0]");
             GLint radiusLoc = glGetUniformLocation(compositeShader, "uEclipseRadius[0]");
+            GLint rimGlowLoc = glGetUniformLocation(compositeShader, "uEclipseRimGlow[0]");
 
             for (auto& p : planets) {
                 if (p.isSun()) continue;
-                if (eclipseCount >= 8) break;
+                if (eclipseCount >= 32) break;
                 glm::vec3 planetPos = p.getPosition();
                 glm::vec3 toSun    = sunPos - planetPos;
                 glm::vec3 toCamera = viewPos - planetPos;
-                if (glm::dot(toSun, toCamera) >= 0.0f) continue;
                 glm::vec4 clip = proj * view * glm::vec4(planetPos, 1.0f);
                 if (clip.w <= 0.0f) continue;
                 glm::vec3 ndc = glm::vec3(clip) / clip.w;
+                if (abs(ndc.x) > 1.2f || abs(ndc.y) > 1.2f) continue;  // 屏外跳过
                 float distToPlanet = glm::length(planetPos - viewPos);
-                // 有大气层的行星：日冕过滤范围 = 大气球体半径 (pSize*1.15)，与渲染边界对齐
-                // 无大气层的行星：日冕过滤范围 = 行星半径 +8% 边距
                 float bodySize = p.hasAtmosphere() ? p.getSize() * 1.15f : p.getSize();
                 float angRadius = glm::atan(bodySize / distToPlanet);
                 float ndcRadius = glm::tan(angRadius) / glm::tan(fovY * 0.5f);
-                // 大气球体已有精确的渲染半径，无需膨胀；普通行星留 8% 防边缘泄漏
-                float inflate = p.hasAtmosphere() ? 1.0f : 1.08f;
-                ndcRadius *= inflate;
                 glUniform2f(centerLoc + eclipseCount, ndc.x, ndc.y);
                 glUniform1f(radiusLoc + eclipseCount, ndcRadius);
+                // rim glow 仅大气凌日行星：太阳在行星背后 + 行星有大气层
+                bool isTransit = (glm::dot(toSun, toCamera) < 0.0f);
+                glUniform1i(rimGlowLoc + eclipseCount, (isTransit && p.hasAtmosphere()) ? 1 : 0);
                 eclipseCount++;
+            }
+            // 卫星也加入日冕遮挡（无大气层，无 rim glow）
+            for (auto& p : planets) {
+                for (auto& m : p.getMoons()) {
+                    if (eclipseCount >= 32) break;
+                    glm::vec3 moonPos = m.worldPosition;
+                    glm::vec4 clip = proj * view * glm::vec4(moonPos, 1.0f);
+                    if (clip.w <= 0.0f) continue;
+                    glm::vec3 ndc = glm::vec3(clip) / clip.w;
+                    if (abs(ndc.x) > 1.2f || abs(ndc.y) > 1.2f) continue;
+                    float distToMoon = glm::length(moonPos - viewPos);
+                    float angRadius = glm::atan(m.size / distToMoon);
+                    float ndcRadius = glm::tan(angRadius) / glm::tan(fovY * 0.5f);
+                    ndcRadius *= 1.08f;
+                    glUniform2f(centerLoc + eclipseCount, ndc.x, ndc.y);
+                    glUniform1f(radiusLoc + eclipseCount, ndcRadius);
+                    glUniform1i(rimGlowLoc + eclipseCount, 0);  // 卫星无 rim glow
+                    eclipseCount++;
+                }
             }
             glUniform1i(countLoc, eclipseCount);
         }
@@ -1011,57 +1428,24 @@ int main() {
         // Pass 7: 镜头炫光 (叠加混合)
         // ================================================================
         if (g_flareEnabled) {
-                float sunVisible = 0.0f;
-            if (sunDiskOnScreen) {
-                float toLeft   = sunScreenX;
-                float toRight  = 1.0f - sunScreenX;
-                float toBottom = sunScreenY;
-                float toTop    = 1.0f - sunScreenY;
-                float nearestEdge = fminf(fminf(toLeft, toRight), fminf(toBottom, toTop));
-                sunVisible = glm::smoothstep(-sunUVRadius, sunUVRadius, nearestEdge);
-
-                // CPU 端角度遮挡检测：检查是否有行星在太阳前面（角距离）
-                if (sunVisible > 0.01f) {
-                    glm::vec3 cameraPos = camera.getPosition();
-                    glm::vec3 toSun = sunPos - cameraPos;
-                    float distToSun = glm::length(toSun);
-                    if (distToSun > 0.1f) {
-                        glm::vec3 sunDir = toSun / distToSun;
-                        float sunAngRadius = glm::atan(kSunRadius / distToSun);  // 太阳角半径
-                        float worstOcclude = 0.0f;
-                        for (size_t i = 1; i < planets.size(); i++) {  // 跳过太阳自身
-                            glm::vec3 planetPos = planets[i].getPosition();
-                            glm::vec3 toPlanet = planetPos - cameraPos;
-                            float distToPlanet = glm::length(toPlanet);
-                            if (distToPlanet < distToSun) {  // 行星在太阳前面
-                                glm::vec3 planetDir = toPlanet / distToPlanet;
-                                float cosAng = glm::clamp(glm::dot(planetDir, sunDir), -1.0f, 1.0f);
-                                float angSep = glm::acos(cosAng);  // 角距离
-                                float planetAngRadius = glm::atan(planets[i].getSize() / distToPlanet) * 1.08f;
-                                if (angSep < planetAngRadius + sunAngRadius) {
-                                    float overlap = (planetAngRadius + sunAngRadius) - angSep;
-                                    float occludeRatio = overlap / (2.0f * sunAngRadius);
-                                    float occludeFactor = glm::smoothstep(0.3f, 1.0f, occludeRatio);
-                                    worstOcclude = fmaxf(worstOcclude, occludeFactor);
-                                }
-                            }
-                        }
-                        // planet完全遮挡 → 炫光完全消失
-                        sunVisible = sunVisible * (1.0f - worstOcclude);
-                    }
-                }
-            }
+            // sunVisibleCombined 已传给 lens flare shader
 
             glEnable(GL_BLEND);
             glBlendFunc(GL_ONE, GL_ONE);
             glDepthMask(GL_FALSE);
             glUseProgram(lensFlareShader);
             checkGLError("lens flare useProgram");
-            glUniform2f(glGetUniformLocation(lensFlareShader, "uSunPos"), sunScreenX, sunScreenY);
-            glUniform1f(glGetUniformLocation(lensFlareShader, "uSunVisible"), sunVisible);
+            glUniform2f(glGetUniformLocation(lensFlareShader, "uSunPos"), flareCenterX, flareCenterY);
+            glUniform1f(glGetUniformLocation(lensFlareShader, "uSunVisible"), sunVisibleCombined);
             glUniform1f(glGetUniformLocation(lensFlareShader, "uSunRadius"), sunUVRadius);
             glUniform1f(glGetUniformLocation(lensFlareShader, "uIntensity"), flareIntensity);
             glUniform1f(glGetUniformLocation(lensFlareShader, "uAspectRatio"), (float)g_screenWidth / g_screenHeight);
+            // 绑定太阳 emissive texture（只有露出来的部分有亮度）
+            glActiveTexture(GL_TEXTURE0 + 8);
+            glBindTexture(GL_TEXTURE_2D, sunEmissiveTex);
+            glUniform1i(glGetUniformLocation(lensFlareShader, "uSunEmissive"), 8);
+            checkGLError("lens flare uSunEmissive");
+
             checkGLError("lens flare uniforms");
             glBindVertexArray(quadVAO);
             glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
@@ -1070,15 +1454,55 @@ int main() {
             glDisable(GL_BLEND);
         }
 
+        // 屏幕右上角渲染 FPS（FreeType）
+        if (g_textRenderer && g_menu.isGameplay()) {
+            char fpsStr[32];
+            snprintf(fpsStr, sizeof(fpsStr), "FPS: %d", g_lastFps);
+            int textWidth = (int)strlen(fpsStr) * 14;
+            float x = (float)(g_screenWidth - textWidth - 20);
+            float y = (float)(g_screenHeight - 30);
+            glDisable(GL_DEPTH_TEST);
+            glEnable(GL_BLEND);
+            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+            g_textRenderer->renderText(fpsStr, x, y, 1.0f, glm::vec3(0.0f, 1.0f, 0.0f));
+            glDisable(GL_BLEND);
+            glEnable(GL_DEPTH_TEST);
+        }
+
+        // 菜单渲染（FreeType，标题画面/暂停/设置）
+        g_menu.render(g_screenWidth, g_screenHeight);
+
+        // 退出检查
+        if (g_menu.isQuit()) glfwSetWindowShouldClose(window, true);
+
         glfwSwapBuffers(window);
         glfwPollEvents();
     }
 
+    // 退出前把运行时状态写回 config
+    config.bloomEnabled   = g_bloomEnabled;
+    config.flareEnabled   = g_flareEnabled;
+    config.autoExposure   = g_autoExposure;
+    config.wireframe      = g_wireframe;
+    config.manualExposure = g_manualExposure;
+    config.resolutionIndex = g_resolutionIndex;
+    config.fullscreen      = g_fullscreen;
+
+    // 相机状态
+    config.cameraPos        = camera.getPosition();
+    config.cameraYaw       = camera.getYaw();
+    config.cameraPitch     = camera.getPitch();
+    config.cameraRoll      = camera.getRoll();
+    config.cameraFov       = camera.getFov();
+    config.cameraSpeed     = camera.getSpeed();
+    config.cameraSensitivity = camera.getSensitivity();
+
+    config.save("config.ini");
+
     glDeleteVertexArrays(1, &quadVAO);
     glDeleteBuffers(1, &quadVBO);
-    glDeleteVertexArrays(1, &axisVAO);
-    glDeleteBuffers(1, &axisVBO);
     deleteSphereLOD(sphereLOD);
+    delete g_textRenderer; g_textRenderer = nullptr;
     glDeleteProgram(sunShader);
     glDeleteProgram(planetShader);
     glDeleteProgram(lensFlareShader);
@@ -1087,7 +1511,6 @@ int main() {
     glDeleteProgram(brightShader);
     glDeleteProgram(blurShader);
     glDeleteProgram(finalShader);
-    glDeleteProgram(axisShader);
     glDeleteProgram(redShader);
     glDeleteProgram(atmosphereShader);
     glDeleteProgram(planetGlowShader);
