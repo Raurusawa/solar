@@ -30,12 +30,8 @@ double g_simTime = 0.0;  // 累积模拟时间（秒），受 timeScale 控制�
 int g_screenWidth = 1280;
 int g_screenHeight = 720;
 bool g_bloomEnabled = true;
-bool g_directOutput = false;
-bool g_testRedSphere = false;
 bool g_flareEnabled = false;
 bool g_autoExposure = false;        // 默认关闭自动曝光，使用固定曝光
-bool g_debugGBuffer = false;       // G 键：直出 G-Buffer 颜色，绕过全部后处理
-bool g_extremeDiagnose = false;    // X 键：极端隔离，G-Buffer 后直接 blit 到屏幕
 bool g_wireframe = false;          // F 键：线框模式
 float g_manualExposure = 0.0f;    // 手动曝光补偿，±2 EV
 float g_fixedExposure = 1.0f;      // 固定曝光值（autoExposure=false 时使用）
@@ -55,6 +51,7 @@ int g_numLumPasses = 0;
 bool g_fboDirty = false;  // FBO 需要重建
 
 void framebuffer_size_callback(GLFWwindow*, int w, int h) {
+    if (w <= 0 || h <= 0) return;  // 忽略最小化窗口（如QQ截图）的 0x0 回调
     glViewport(0, 0, w, h);
     g_screenWidth = w;
     g_screenHeight = h;
@@ -132,7 +129,6 @@ void createQuad() {
     glEnableVertexAttribArray(1);
     glBindVertexArray(0);
     checkGLError("createQuad");
-    std::cout << "[DEBUG] Quad VAO: " << quadVAO << std::endl;
 }
 
 // ======================== G-Buffer FBO (MRT) ========================
@@ -183,7 +179,6 @@ bool createGBuffer(int w, int h) {
         std::cerr << "[ERROR] G-Buffer FBO incomplete! 0x" << std::hex << status << std::dec << std::endl;
         return false;
     }
-    std::cout << "[DEBUG] G-Buffer FBO " << gBufferFBO << " complete (" << w << "x" << h << ")" << std::endl;
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
     checkGLError("createGBuffer");
     return true;
@@ -207,8 +202,6 @@ void createSSAOFBO(int w, int h) {
     glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, ssaoTex, 0);
 
     GLenum status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
-    std::cout << "[DEBUG] SSAO FBO " << ssaoFBO << " " << (status == GL_FRAMEBUFFER_COMPLETE ? "OK" : "FAIL") << std::endl;
-
     // Noise texture for random rotation (4x4)
     std::uniform_real_distribution<float> dist(0.0f, 1.0f);
     std::default_random_engine rng(42);
@@ -251,8 +244,6 @@ void createSunEmissiveFBO(int w, int h) {
     glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, sunEmissiveDepth);
 
     GLenum status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
-    std::cout << "[DEBUG] SunEmissive FBO " << sunEmissiveFBO << " "
-              << (status == GL_FRAMEBUFFER_COMPLETE ? "OK" : "FAIL") << std::endl;
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
     checkGLError("createSunEmissiveFBO");
 }
@@ -274,8 +265,6 @@ void createSceneFBO(int w, int h) {
     glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, sceneTex, 0);
 
     GLenum status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
-    std::cout << "[DEBUG] Scene FBO " << sceneFBO << " " << (status == GL_FRAMEBUFFER_COMPLETE ? "OK" : "FAIL") << std::endl;
-
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
     checkGLError("createSceneFBO");
 }
@@ -294,7 +283,6 @@ bool createBlurFBOs(int w, int h) {
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
         glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, blurTex[i], 0);
         GLenum status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
-        std::cout << "[DEBUG] Blur FBO " << i << " (" << blurFBO[i] << ") ";
         if (status != GL_FRAMEBUFFER_COMPLETE) {
             std::cerr << "INCOMPLETE! 0x" << std::hex << status << std::dec << std::endl;
             return false;
@@ -369,7 +357,6 @@ bool recreateFBOs(int w, int h) {
     }
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
     g_adaptedLogLum = log(0.05f);  // 重置自适应曝光
-    std::cout << "[DEBUG] FBOs recreated: " << w << "x" << h << std::endl;
     return true;
 }
 
@@ -467,8 +454,6 @@ int main() {
     glewExperimental = GL_TRUE;
     if (glewInit() != GLEW_OK) return -1;
     glEnable(GL_DEPTH_TEST);
-    std::cout << "[DEBUG] OpenGL " << glGetString(GL_VERSION) << " GLSL " << glGetString(GL_SHADING_LANGUAGE_VERSION) << std::endl;
-
     // ======================= 加载进度条 =======================
     const char* progVertSrc = R"(#version 330 core
 layout(location = 0) in vec2 aPos;
@@ -580,7 +565,6 @@ void main() {
     // 菜单系统（FreeType）
     g_menu.init(window, g_textRenderer);
     g_menu.setGlobals(&g_bloomEnabled, &g_flareEnabled, &g_autoExposure,
-                      &g_directOutput, &g_testRedSphere, &g_debugGBuffer, &g_extremeDiagnose,
                       nullptr, nullptr, &g_manualExposure, &g_wireframe,
                       &g_resolutionIndex, &g_fullscreen, &g_screenWidth, &g_screenHeight);
 
@@ -662,20 +646,12 @@ void main() {
         }
     }
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
-    std::cout << "[DEBUG] Luminance FBO chain: " << g_numLumPasses << " passes" << std::endl;
-
     showLoadingProgress(window, "Compiling shader - luminance...", (float)(step++) / totalSteps);
     std::string lumFragSrc = readShaderFile((sp + "luminance.frag").c_str());
     lumShader = createShaderProgram(postVertexSrc, lumFragSrc.c_str());
     if (!lumShader) { std::cerr << "Luminance shader failed!" << std::endl; return -1; }
 
     SphereLOD sphereLOD = createSphereLOD();
-    std::cout << "[DEBUG] LOD indices: "
-              << sphereLOD.levels[0].indexCount << " / "
-              << sphereLOD.levels[1].indexCount << " / "
-              << sphereLOD.levels[2].indexCount << " / "
-              << sphereLOD.levels[3].indexCount << std::endl;
-
     Camera camera(config.cameraPos, config.cameraYaw, config.cameraPitch, config.cameraRoll,
                   config.cameraFov, config.cameraSpeed, config.cameraSensitivity);
     g_camera = &camera;
@@ -696,7 +672,6 @@ void main() {
         double jd = now / 86400.0 + 2440587.5;        // Unix epoch → JD
         double daysSinceJ2000 = jd - 2451545.0; // JD → J2000.0 offset
         Planet::setEpochDays(daysSinceJ2000);
-        std::cout << "[DEBUG] Days since J2000.0: " << daysSinceJ2000 << std::endl;
     }
 
     // 设置每颗行星的轨道力学参数
@@ -707,8 +682,6 @@ void main() {
             pc.longitudeAscendingNode, pc.argumentOfPeriapsis,
             pc.meanAnomalyAtEpoch, pc.axialTilt);
     }
-
-    std::cout << "[DEBUG] Planets: " << planets.size() << std::endl;
 
     // ========== 卫星 (从 config.ini 读取) ==========
     auto findPlanet = [&](const std::string& name) -> Planet* {
@@ -731,8 +704,6 @@ void main() {
 
     int totalMoons = 0;
     for (auto& p : planets) totalMoons += (int)p.getMoons().size();
-    std::cout << "[DEBUG] Moons: " << totalMoons << std::endl;
-
     // 卫星光照用 fallback 白色纹理
     unsigned int whiteTex;
     {
@@ -884,8 +855,9 @@ void main() {
         const float MAX_FAR  = 200000.0f;
         float dynamicFar = glm::clamp((float)minDistToSurface * 10.0f, BASE_FAR, MAX_FAR);
 
+        float aspect = (g_screenHeight > 0) ? (float)g_screenWidth / g_screenHeight : 1.0f;
         glm::mat4 proj = glm::perspective(glm::radians(camera.getFov()),
-                                          (float)g_screenWidth / g_screenHeight,
+                                          aspect,
                                           dynamicNear, dynamicFar);
 
         // ================================================================
@@ -1062,45 +1034,6 @@ void main() {
         glDisable(GL_BLEND);
         checkGLError("atmosphere pass");
 
-        if (g_testRedSphere) {
-            glUseProgram(redShader);
-            glm::mat4 model = glm::scale(glm::mat4(1.0f), glm::vec3(10.0f));
-            glUniformMatrix4fv(glGetUniformLocation(redShader, "model"), 1, GL_FALSE, glm::value_ptr(model));
-            glUniformMatrix4fv(glGetUniformLocation(redShader, "view"), 1, GL_FALSE, glm::value_ptr(view));
-            glUniformMatrix4fv(glGetUniformLocation(redShader, "projection"), 1, GL_FALSE, glm::value_ptr(proj));
-            glBindVertexArray(sphereLOD.levels[1].VAO);  // LOD1 for diagnostic sphere
-            glDrawElements(GL_TRIANGLES, sphereLOD.levels[1].indexCount, GL_UNSIGNED_INT, 0);
-            checkGLError("red sphere draw");
-        }
-
-        // ===== G-Buffer 直出诊断：绕过全部后处理 =====
-        if (g_debugGBuffer) {
-            glBindFramebuffer(GL_READ_FRAMEBUFFER, gBufferFBO);
-            glReadBuffer(GL_COLOR_ATTACHMENT0);
-            glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
-            glBlitFramebuffer(0, 0, g_screenWidth, g_screenHeight,
-                              0, 0, g_screenWidth, g_screenHeight,
-                              GL_COLOR_BUFFER_BIT, GL_NEAREST);
-            glBindFramebuffer(GL_FRAMEBUFFER, 0);
-            glfwSwapBuffers(window);
-            glfwPollEvents();
-            continue;
-        }
-
-        // ===== 极端隔离：G-Buffer 后直接 blit，跳过所有后续 pass =====
-        if (g_extremeDiagnose) {
-            glBindFramebuffer(GL_READ_FRAMEBUFFER, gBufferFBO);
-            glReadBuffer(GL_COLOR_ATTACHMENT0);
-            glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
-            glBlitFramebuffer(0, 0, g_screenWidth, g_screenHeight,
-                              0, 0, g_screenWidth, g_screenHeight,
-                              GL_COLOR_BUFFER_BIT, GL_NEAREST);
-            glBindFramebuffer(GL_FRAMEBUFFER, 0);
-            glfwSwapBuffers(window);
-            glfwPollEvents();
-            continue;
-        }
-
         // ================================================================
         // Pass 1.5: Sun Emissive → 独立 FBO（深度测试隔离行星遮挡）
         // ================================================================
@@ -1174,8 +1107,9 @@ void main() {
         float sunUVRadius = 0.05f;
         bool sunDiskOnScreen = false;
         {
+            double aspectD = (g_screenHeight > 0) ? (double)g_screenWidth / g_screenHeight : 1.0;
             glm::dmat4 projD = glm::perspective(glm::radians((double)camera.getFov()),
-                                                (double)g_screenWidth / g_screenHeight,
+                                                aspectD,
                                                 (double)dynamicNear, (double)dynamicFar);
             glm::dvec4 sunClip = projD * viewD * glm::dvec4(sunPos.x, sunPos.y, sunPos.z, 1.0);
             if (sunClip.w > 0.0) {
@@ -1490,7 +1424,6 @@ void main() {
         glUniform1f(glGetUniformLocation(finalShader, "fixedExposure"), g_fixedExposure);
         glUniform1f(glGetUniformLocation(finalShader, "manualExposure"), g_manualExposure);
         glUniform1f(glGetUniformLocation(finalShader, "bloomStrength"), g_bloomEnabled ? 0.4f : 0.0f);
-        glUniform1i(glGetUniformLocation(finalShader, "directOutput"), g_directOutput ? 1 : 0);
         glBindVertexArray(quadVAO);
         glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
         glEnable(GL_DEPTH_TEST);
