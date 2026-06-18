@@ -205,3 +205,13 @@ bool TextRenderer::getGlyphMetrics(float scale,
     totalHeightOut = (float)c.size.y      * scale;
     return true;
 }
+
+float TextRenderer::getTextWidth(const std::string& text, float scale) const {
+    float width = 0.0f;
+    for (auto ch : text) {
+        auto it = m_characters.find(ch);
+        if (it == m_characters.end()) continue;
+        width += (it->second.advance >> 6) * scale;
+    }
+    return width;
+}

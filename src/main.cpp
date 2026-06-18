@@ -6,6 +6,8 @@
 #include <ctime>
 #include <cmath>
 #include <cstdio>
+#include <thread>
+#include <chrono>
 #include <glm/glm.hpp>
 #include <glm/gtc/matrix_transform.hpp>
 #include <glm/gtc/type_ptr.hpp>
@@ -465,17 +467,119 @@ int main() {
     if (glewInit() != GLEW_OK) return -1;
     glEnable(GL_DEPTH_TEST);
     std::cout << "[DEBUG] OpenGL " << glGetString(GL_VERSION) << " GLSL " << glGetString(GL_SHADING_LANGUAGE_VERSION) << std::endl;
-    std::cout << "[DEBUG] Renderer: " << glGetString(GL_RENDERER) << std::endl;
 
+    // ======================= 加载进度条 =======================
+    const char* progVertSrc = R"(#version 330 core
+layout(location = 0) in vec2 aPos;
+out vec2 vNDC;
+void main() {
+    vNDC = aPos;
+    gl_Position = vec4(aPos, 0.0, 1.0);
+}
+)";
+    const char* progFragSrc = R"(#version 330 core
+in vec2 vNDC;
+out vec4 FragColor;
+uniform float uProgress;
+uniform vec3 uBgColor;
+uniform vec3 uBarColor;
+uniform vec3 uBorderColor;
+uniform float uBarY;
+uniform float uBarH;
+uniform float uBarW;
+void main() {
+    // NDC [-1,1]: center=0, uBarW = half-width (0.94 → bar spans -0.94..0.94 = 94% of screen)
+    float barLeft   = -uBarW;
+    float barRight  = uBarW;
+    float barTop    = uBarY + uBarH * 0.5;
+    float barBottom = uBarY - uBarH * 0.5;
+    float border = 0.003;
+    bool inBorder = (vNDC.x >= barLeft - border && vNDC.x <= barRight + border &&
+                     vNDC.y >= barBottom - border && vNDC.y <= barTop + border);
+    bool inBar = (vNDC.x >= barLeft && vNDC.x <= barRight &&
+                  vNDC.y >= barBottom && vNDC.y <= barTop);
+    float fillRight = barLeft + 2.0 * uBarW * uProgress;
+    if (vNDC.x >= barLeft && vNDC.x <= fillRight && inBar) {
+        FragColor = vec4(uBarColor, 1.0);
+    } else if (inBar && vNDC.x > fillRight) {
+        FragColor = vec4(uBgColor * 0.3, 0.7);
+    } else if (inBorder && !inBar) {
+        FragColor = vec4(uBorderColor, 0.6);
+    } else {
+        discard;
+    }
+}
+)";
+    unsigned int progShader = createShaderProgram(progVertSrc, progFragSrc);
+    unsigned int progVAO, progVBO;
+    { float q[] = {-1,-1, 1,-1, -1,1, 1,1};
+      glGenVertexArrays(1, &progVAO); glGenBuffers(1, &progVBO);
+      glBindVertexArray(progVAO); glBindBuffer(GL_ARRAY_BUFFER, progVBO);
+      glBufferData(GL_ARRAY_BUFFER, sizeof(q), q, GL_STATIC_DRAW);
+      glVertexAttribPointer(0,2,GL_FLOAT,GL_FALSE,0,0); glEnableVertexAttribArray(0); }
+    GLint g_progColorLoc = glGetUniformLocation(progShader, "uBarColor");
+    GLint g_progProgressLoc = glGetUniformLocation(progShader, "uProgress");
+    GLint g_progBarYLoc = glGetUniformLocation(progShader, "uBarY");
+    GLint g_progBarHLoc = glGetUniformLocation(progShader, "uBarH");
+    GLint g_progBarWLoc = glGetUniformLocation(progShader, "uBarW");
+    GLint g_progBgLoc = glGetUniformLocation(progShader, "uBgColor");
+    GLint g_progBorderLoc = glGetUniformLocation(progShader, "uBorderColor");
+    auto showLoadingProgress = [&](GLFWwindow* w, const char* msg, float frac) {
+        glClearColor(0.02f, 0.02f, 0.05f, 1.0f);
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+        // 画进度条
+        glUseProgram(progShader);
+        glUniform1f(g_progProgressLoc, frac);
+        glUniform1f(g_progBarYLoc, -0.88f);
+        glUniform1f(g_progBarHLoc, 0.072f);
+        glUniform1f(g_progBarWLoc, 0.94f);
+        glUniform3f(g_progBgLoc, 0.15f, 0.15f, 0.18f);
+        glUniform3f(g_progBorderLoc, 0.5f, 0.5f, 0.6f);
+        glUniform3f(g_progColorLoc, 0.3f, 0.6f, 1.0f);
+        glBindVertexArray(progVAO);
+        glDisable(GL_DEPTH_TEST);
+        glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+        // 文字：FreeType（需要 blending + 无深度测试）
+        if (g_textRenderer && msg) {
+            float sH = (float)g_screenHeight;
+            float textScale = sH / 1080.0f;
+            char buf[128];
+            int pct = (int)(frac * 100.0f + 0.5f);
+            snprintf(buf, sizeof(buf), "%3d%% %s", pct, msg);
+            std::string text(buf);
+            // 水平居中：精确计算文字宽度
+            float tw = g_textRenderer->getTextWidth(text, textScale);
+            float tx = ((float)g_screenWidth - tw) * 0.5f;
+            // 垂直居中：barCenter = (1-0.88)*0.5*sH = 0.06*sH
+            float barCenterPx = (1.0f - 0.88f) * 0.5f * sH;
+            float ascender, totalH;
+            float ty;
+            if (g_textRenderer->getGlyphMetrics(textScale, ascender, totalH))
+                ty = barCenterPx + (totalH * 0.5f - ascender);
+            else
+                ty = barCenterPx;
+            glEnable(GL_BLEND);
+            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+            glDisable(GL_DEPTH_TEST);
+            g_textRenderer->renderText(text, tx, ty, textScale, glm::vec3(1.0f));
+            glDisable(GL_BLEND);
+        }
+        glEnable(GL_DEPTH_TEST);
+        glfwSwapBuffers(w);
+        glfwPollEvents();
+    };
     glfwGetFramebufferSize(window, &g_screenWidth, &g_screenHeight);
-    std::cout << "[DEBUG] Window: " << g_screenWidth << "x" << g_screenHeight << std::endl;
 
-    // 文字渲染器（FreeType）
+    // 文字渲染器（FreeType）—— 在进度条之前创建，使第一次显示就有文字
     g_textRenderer = new TextRenderer(g_screenWidth, g_screenHeight);
+
+    // 初始进度 0
+    showLoadingProgress(window, "Initializing...", 0.0f);
 
     // 菜单系统（FreeType）
     g_menu.init(window, g_textRenderer);
     g_menu.setGlobals(&g_bloomEnabled, &g_flareEnabled, &g_autoExposure,
+                      &g_directOutput, &g_testRedSphere, &g_debugGBuffer, &g_extremeDiagnose,
                       nullptr, nullptr, &g_manualExposure, &g_wireframe,
                       &g_resolutionIndex, &g_fullscreen, &g_screenWidth, &g_screenHeight);
 
@@ -485,19 +589,30 @@ int main() {
     // 着色器（路径前缀来自 config.shaderPath）
     const std::string& sp = config.shaderPath;
 
+    int totalSteps = 43; int step = 0;
+    showLoadingProgress(window, "Compiling shader - sun...", (float)(step++) / totalSteps);
     unsigned int sunShader       = createShaderProgramFromFiles((sp + "planet.vert").c_str(), (sp + "sun.frag").c_str());
+    showLoadingProgress(window, "Compiling shader - planet...", (float)(step++) / totalSteps);
     unsigned int planetShader    = createShaderProgramFromFiles((sp + "planet.vert").c_str(), (sp + "planet.frag").c_str());
+    showLoadingProgress(window, "Compiling shader - lensflare...", (float)(step++) / totalSteps);
     unsigned int lensFlareShader = createShaderProgramFromFiles((sp + "lensflare.vert").c_str(), (sp + "lensflare.frag").c_str());
-    std::string ssaoSrc      = readShaderFile((sp + "ssao.frag").c_str());
-    std::string compositeSrc = readShaderFile((sp + "composite.frag").c_str());
+    showLoadingProgress(window, "Compiling shader - SSAO...", (float)(step++) / totalSteps);
+    std::string ssaoSrc      = readShaderFile((sp + "ssao.frag").c_str()); // read-only
+    showLoadingProgress(window, "Compiling shader - composite...", (float)(step++) / totalSteps);
     unsigned int ssaoShader      = createShaderProgram(postVertexSrc, ssaoSrc.c_str());
+    std::string compositeSrc = readShaderFile((sp + "composite.frag").c_str());
     unsigned int compositeShader = createShaderProgram(postVertexSrc, compositeSrc.c_str());
+    showLoadingProgress(window, "Compiling shader - bright...", (float)(step++) / totalSteps);
     unsigned int brightShader    = createShaderProgram(postVertexSrc, brightFragSrc);
+    showLoadingProgress(window, "Compiling shader - blur...", (float)(step++) / totalSteps);
     unsigned int blurShader      = createShaderProgram(postVertexSrc, blurFragSrc);
+    showLoadingProgress(window, "Compiling shader - final...", (float)(step++) / totalSteps);
     std::string finalSrc = readShaderFile((sp + "final.frag").c_str());
     unsigned int finalShader     = createShaderProgram(postVertexSrc, finalSrc.c_str());
+    showLoadingProgress(window, "Compiling shader - atmosphere...", (float)(step++) / totalSteps);
     unsigned int redShader       = createShaderProgram(redVertSrc, redFragSrc);
     unsigned int atmosphereShader = createShaderProgramFromFiles((sp + "atmosphere.vert").c_str(), (sp + "atmosphere.frag").c_str());
+    showLoadingProgress(window, "Compiling shader - planet glow...", (float)(step++) / totalSteps);
     unsigned int planetGlowShader = createShaderProgramFromFiles((sp + "planet_glow.vert").c_str(), (sp + "planet_glow.frag").c_str());
 
 
@@ -548,7 +663,7 @@ int main() {
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
     std::cout << "[DEBUG] Luminance FBO chain: " << g_numLumPasses << " passes" << std::endl;
 
-    // Luminance shader
+    showLoadingProgress(window, "Compiling shader - luminance...", (float)(step++) / totalSteps);
     std::string lumFragSrc = readShaderFile((sp + "luminance.frag").c_str());
     lumShader = createShaderProgram(postVertexSrc, lumFragSrc.c_str());
     if (!lumShader) { std::cerr << "Luminance shader failed!" << std::endl; return -1; }
@@ -566,6 +681,8 @@ int main() {
 
     std::vector<Planet> planets;
     for (auto& p : config.planets) {
+        char pmsg[64]; snprintf(pmsg, sizeof(pmsg), "Loading texture - %s...", p.name.c_str());
+        showLoadingProgress(window, pmsg, (float)(step++) / totalSteps);
         unsigned int tex = loadTexture(p.texturePath, p.color);
         bool atm = (p.name == "earth" || p.name == "venus" || p.name == "mars");
         planets.emplace_back(p.name, p.orbitRadius, p.orbitPeriod, p.rotationPeriod,
@@ -604,6 +721,8 @@ int main() {
             std::cerr << "WARNING: Moon '" << mc.name << "' parent '" << mc.parent << "' not found" << std::endl;
             continue;
         }
+        char mmsg[64]; snprintf(mmsg, sizeof(mmsg), "Loading texture - %s...", mc.name.c_str());
+        showLoadingProgress(window, mmsg, (float)(step++) / totalSteps);
         unsigned int tex = loadTexture(mc.texturePath, mc.color);
         parent->addMoon(mc.name, mc.orbitRadius, mc.orbitPeriod,
                         mc.meanAnomalyAtEpoch, mc.size, mc.color, tex);
@@ -663,9 +782,6 @@ int main() {
     float coronaIntensity = 0.5f;
     float kSunRadius = 15.0f;  // 与 config.ini 同步，用于角度计算
 
-    bool nPressedLast = false, tPressedLast = false;
-    bool plusPressedLast = false, minusPressedLast = false;
-    bool gPressedLast = false, xPressedLast = false;
     bool escapePressedLast = false;
 
     float fpsAccum = 0.0f;
@@ -705,37 +821,6 @@ int main() {
             else
                 g_menu.back();
         }
-        if (glfwGetKey(window, GLFW_KEY_N) == GLFW_PRESS && !nPressedLast) {
-            g_directOutput = !g_directOutput;
-            std::cout << "[INFO] Direct output: " << (g_directOutput ? "ON" : "OFF") << std::endl;
-        }
-        if (glfwGetKey(window, GLFW_KEY_T) == GLFW_PRESS && !tPressedLast) {
-            g_testRedSphere = !g_testRedSphere;
-            std::cout << "[INFO] Test red sphere: " << (g_testRedSphere ? "ON" : "OFF") << std::endl;
-        }
-        // 手动曝光补偿
-        if (glfwGetKey(window, GLFW_KEY_KP_ADD) == GLFW_PRESS && !plusPressedLast) {
-            g_manualExposure += 0.5f;
-            std::cout << "[INFO] Manual exposure: " << g_manualExposure << std::endl;
-        }
-        if (glfwGetKey(window, GLFW_KEY_KP_SUBTRACT) == GLFW_PRESS && !minusPressedLast) {
-            g_manualExposure -= 0.5f;
-            std::cout << "[INFO] Manual exposure: " << g_manualExposure << std::endl;
-        }
-        if (glfwGetKey(window, GLFW_KEY_G) == GLFW_PRESS && !gPressedLast) {
-            g_debugGBuffer = !g_debugGBuffer;
-            std::cout << "[INFO] G-Buffer direct: " << (g_debugGBuffer ? "ON" : "OFF") << std::endl;
-        }
-        if (glfwGetKey(window, GLFW_KEY_X) == GLFW_PRESS && !xPressedLast) {
-            g_extremeDiagnose = !g_extremeDiagnose;
-            std::cout << "[INFO] Extreme diagnose: " << (g_extremeDiagnose ? "ON" : "OFF") << std::endl;
-        }
-        nPressedLast = (glfwGetKey(window, GLFW_KEY_N) == GLFW_PRESS);
-        tPressedLast = (glfwGetKey(window, GLFW_KEY_T) == GLFW_PRESS);
-        gPressedLast = (glfwGetKey(window, GLFW_KEY_G) == GLFW_PRESS);
-        xPressedLast = (glfwGetKey(window, GLFW_KEY_X) == GLFW_PRESS);
-        plusPressedLast = (glfwGetKey(window, GLFW_KEY_KP_ADD) == GLFW_PRESS);
-        minusPressedLast = (glfwGetKey(window, GLFW_KEY_KP_SUBTRACT) == GLFW_PRESS);
         escapePressedLast = (glfwGetKey(window, GLFW_KEY_ESCAPE) == GLFW_PRESS);
 
         if (g_menu.isGameplay()) {
@@ -747,6 +832,15 @@ int main() {
             camera.processKeyboard(GLFW_KEY_E, glfwGetKey(window, GLFW_KEY_E), g_deltaTime);
             camera.processKeyboard(GLFW_KEY_R, glfwGetKey(window, GLFW_KEY_R), g_deltaTime);
             camera.processKeyboard(GLFW_KEY_F, glfwGetKey(window, GLFW_KEY_F), g_deltaTime);
+            // 碰撞边界必须在 update() 之前设置，才能过滤位移
+            std::vector<CollisionSphere> collisionSpheres;
+            for (auto& p : planets) {
+                collisionSpheres.push_back({p.getPosition(), p.getSize() * 1.002});
+                for (auto& m : p.getMoons()) {
+                    collisionSpheres.push_back({m.worldPosition, m.size * 1.002});
+                }
+            }
+            camera.setCollisionBoundaries(collisionSpheres, 1.002);
             camera.update(g_deltaTime);
         }
 
@@ -759,26 +853,25 @@ int main() {
         glm::mat4 view = camera.getViewMatrix();
         glm::mat4 viewRot = glm::mat4(glm::mat3(view));  // 仅旋转部分，配合相对坐标 model 使用
 
-        // dynamic near plane: 近平面 = 到最近表面距离 × 0.5，确保永远小于表面距离
-        // 时间平滑防止深度编码逐帧跳变导致 SSAO/大气抖动
+        // dynamic near plane: 近平面 = 到最近表面距离 × 0.5，实时调整
         float targetNear = 0.1f;
+        float minDistToSurface = 1e10f;
         for (auto& p : planets) {
             float distToSurface = glm::length(p.getPosition() - viewPos) - p.getSize();
-            if (distToSurface < 0.0f) distToSurface = 0.001f;
+            if (distToSurface < 0.0f) distToSurface = 1e-5f;
+            if (distToSurface < minDistToSurface) minDistToSurface = distToSurface;
             float nearForThis = distToSurface * 0.5f;
             if (nearForThis < targetNear) targetNear = nearForThis;
             for (auto& m : p.getMoons()) {
                 float moonDistToSurface = glm::length(m.worldPosition - viewPos) - m.size;
-                if (moonDistToSurface < 0.0f) moonDistToSurface = 0.001f;
+                if (moonDistToSurface < 0.0f) moonDistToSurface = 1e-5f;
+                if (moonDistToSurface < minDistToSurface) minDistToSurface = moonDistToSurface;
                 float moonNear = moonDistToSurface * 0.5f;
                 if (moonNear < targetNear) targetNear = moonNear;
             }
         }
-        if (targetNear < 0.001f) targetNear = 0.001f;
-        static float smoothedNear = 0.1f;
-        float blend = glm::clamp(g_deltaTime * 3.0f, 0.0f, 1.0f);  // ~0.3s 适应
-        smoothedNear += (targetNear - smoothedNear) * blend;
-        float dynamicNear = smoothedNear;
+        if (targetNear < 1e-5f) targetNear = 1e-5f;
+        float dynamicNear = targetNear;  // 实时，无平滑延迟
         glm::mat4 proj = glm::perspective(glm::radians(camera.getFov()),
                                           (float)g_screenWidth / g_screenHeight,
                                           dynamicNear, 80000.0f);
@@ -872,7 +965,7 @@ int main() {
                     glBindVertexArray(pointVAO);
                     glDrawArrays(GL_POINTS, 0, 1);
                 } else {
-                    // 正常球体渲染 — 相机相对坐标避免 float 精度丢失
+                    // 正常球体渲染 - 相机相对坐标避免 float 精度丢失
                     auto lod = selectLOD(sphereLOD, dist, m.size, config.cameraFov, g_screenHeight);
                     // 对很小的天体（size < 0.01），强制用最高精度
                     if (m.size < 0.01f) {
@@ -892,7 +985,7 @@ int main() {
             glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
         }
 
-        // ===== 大气散射 (Rayleigh + Mie) — additive 叠加 =====
+        // ===== 大气散射 (Rayleigh + Mie) - additive 叠加 =====
         glEnable(GL_BLEND);
         glBlendFunc(GL_ONE, GL_ONE);
         glDepthMask(GL_FALSE);
@@ -1012,7 +1105,7 @@ int main() {
             glEnable(GL_DEPTH_TEST);
             glDepthFunc(GL_LEQUAL);
             glDepthMask(GL_FALSE);
-            // 渲染太阳 emissive — 被行星遮挡的像素自动不写入
+            // 渲染太阳 emissive - 被行星遮挡的像素自动不写入
             {
                 auto lod = sphereLOD.levels[0];
                 for (auto& p : planets) {
@@ -1174,7 +1267,9 @@ int main() {
 
         // 日冕强度：按太阳 disc 屏幕内可见比例缩放（基于可见中心，不是太阳中心NDC）
         float actualCoronaIntensity = coronaIntensity * screenFrac;
-        glUniform1f(glGetUniformLocation(compositeShader, "uSSAOStrength"), ssaoStrength);
+        float ssaoDistanceFactor = glm::smoothstep(0.5f, 3.0f, minDistToSurface);
+        float effectiveSSAO = ssaoStrength * ssaoDistanceFactor;
+        glUniform1f(glGetUniformLocation(compositeShader, "uSSAOStrength"), effectiveSSAO);
         glUniform2f(glGetUniformLocation(compositeShader, "uSunPos"), sunScreenX, sunScreenY);
         glUniform1f(glGetUniformLocation(compositeShader, "uSunRadius"), sunUVRadius);
         glUniform1f(glGetUniformLocation(compositeShader, "uIntensity"), actualCoronaIntensity);

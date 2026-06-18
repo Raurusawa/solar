@@ -21,6 +21,9 @@ public:
                     float scale, glm::vec3 color);
     void resize(int w, int h) { m_screenWidth = w; m_screenHeight = h; }
 
+    // 计算文本渲染后的总像素宽度（用于水平居中）
+    float getTextWidth(const std::string& text, float scale) const;
+
     // 获取典型大写字母（'M'）的字形度量，用于垂直居中计算
     // ascenderOut: baseline 到字形顶部的距离 (像素, 已乘 scale)
     // totalHeightOut: 字形总高度 (像素, 已乘 scale)

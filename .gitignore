@@ -3,10 +3,6 @@
 *.o
 solar_system
 
-# Libraries (system-installed via MSYS2)
-glew32.dll
-glfw3.dll
-
 # Screenshots & temp images
 *.png
 screenshot*.png

@@ -4,6 +4,7 @@
 #include <vector>
 #include <string>
 #include <cstring>
+#include <iostream>
 #include <glm/glm.hpp>
 
 // 来自 main.cpp：切回 gameplay 时重置 firstMouse，避免视角跳动
@@ -132,19 +133,24 @@ void Menu::setState(MenuState s) {
 }
 
 void Menu::setGlobals(bool* bloom, bool* flare, bool* autoExp,
+                      bool* directOut, bool* testRed, bool* debugGBuf, bool* extremeDiag,
                       float* bn, float* fl, float* manExp, bool* wireframe,
                       int* resIndex, bool* fullscr, int* scrW, int* scrH) {
-    m_bloomEnabled   = bloom;
-    m_flareEnabled   = flare;
-    m_autoExposure   = autoExp;
-    m_bloomStrength  = bn;
-    m_flareIntensity = fl;
-    m_manualExposure = manExp;
-    m_wireframe      = wireframe;
+    m_bloomEnabled    = bloom;
+    m_flareEnabled    = flare;
+    m_autoExposure    = autoExp;
+    m_directOutput    = directOut;
+    m_testRedSphere   = testRed;
+    m_debugGBuffer    = debugGBuf;
+    m_extremeDiagnose = extremeDiag;
+    m_bloomStrength   = bn;
+    m_flareIntensity  = fl;
+    m_manualExposure  = manExp;
+    m_wireframe       = wireframe;
     m_resolutionIndex = resIndex;
-    m_fullscreen     = fullscr;
-    m_screenWidth    = scrW;
-    m_screenHeight   = scrH;
+    m_fullscreen      = fullscr;
+    m_screenWidth     = scrW;
+    m_screenHeight    = scrH;
 }
 
 void Menu::togglePause() {
@@ -207,10 +213,11 @@ void Menu::buildPauseButtons() {
 
 void Menu::buildSettingsButtons() {
     m_buttons.clear();
-    float bh = 0.09f;  // 按钮高度
+    float bh = 0.065f;  // 按钮高度，紧凑容纳11行
+    float gap = 0.02f;
 
     // 每行：标签（左）+ 值（右）
-    auto rowY = [&](int r) -> float { return 0.40f - r * (bh + 0.03f); };
+    auto rowY = [&](int r) -> float { return 0.40f - r * (bh + gap); };
 
     // Row 0: Bloom
     m_buttons.emplace_back(-0.55f, rowY(0), 0.45f, bh, "Bloom",
@@ -236,16 +243,54 @@ void Menu::buildSettingsButtons() {
     m_buttons.emplace_back( 0.10f, rowY(3), 0.30f, bh, "val_wire",
         [this](){ if(m_wireframe) *m_wireframe = !*m_wireframe; });
 
-    // Row 4: Fullscreen
-    m_buttons.emplace_back(-0.55f, rowY(4), 0.45f, bh, "Fullscreen",
+    // Row 4: Direct Output
+    m_buttons.emplace_back(-0.55f, rowY(4), 0.45f, bh, "Direct Output",
+        [this](){ if(m_directOutput) *m_directOutput = !*m_directOutput; });
+    m_buttons.emplace_back( 0.10f, rowY(4), 0.30f, bh, "val_direct",
+        [this](){ if(m_directOutput) *m_directOutput = !*m_directOutput; });
+
+    // Row 5: Test Sphere
+    m_buttons.emplace_back(-0.55f, rowY(5), 0.45f, bh, "Test Sphere",
+        [this](){ if(m_testRedSphere) *m_testRedSphere = !*m_testRedSphere; });
+    m_buttons.emplace_back( 0.10f, rowY(5), 0.30f, bh, "val_test",
+        [this](){ if(m_testRedSphere) *m_testRedSphere = !*m_testRedSphere; });
+
+    // Row 6: G-Buffer View
+    m_buttons.emplace_back(-0.55f, rowY(6), 0.45f, bh, "G-Buffer View",
+        [this](){ if(m_debugGBuffer) *m_debugGBuffer = !*m_debugGBuffer; });
+    m_buttons.emplace_back( 0.10f, rowY(6), 0.30f, bh, "val_gbuf",
+        [this](){ if(m_debugGBuffer) *m_debugGBuffer = !*m_debugGBuffer; });
+
+    // Row 7: Diagnose
+    m_buttons.emplace_back(-0.55f, rowY(7), 0.45f, bh, "Diagnose",
+        [this](){ if(m_extremeDiagnose) *m_extremeDiagnose = !*m_extremeDiagnose; });
+    m_buttons.emplace_back( 0.10f, rowY(7), 0.30f, bh, "val_diag",
+        [this](){ if(m_extremeDiagnose) *m_extremeDiagnose = !*m_extremeDiagnose; });
+
+    // Row 8: Exposure (轮换: 0.0 → +0.5 → +1.0 → 0.0)
+    m_buttons.emplace_back(-0.55f, rowY(8), 0.45f, bh, "Exposure",
+        [this](){  });
+    m_buttons.emplace_back( 0.10f, rowY(8), 0.30f, bh, "val_exp",
+        [this](){
+            if (m_manualExposure) {
+                float cur = *m_manualExposure;
+                if (cur < 0.25f) *m_manualExposure = 0.5f;
+                else if (cur < 0.75f) *m_manualExposure = 1.0f;
+                else *m_manualExposure = 0.0f;
+                std::cout << "[INFO] Manual exposure: " << *m_manualExposure << std::endl;
+            }
+        });
+
+    // Row 9: Fullscreen
+    m_buttons.emplace_back(-0.55f, rowY(9), 0.45f, bh, "Fullscreen",
         [this](){ if(m_fullscreen) { *m_fullscreen = !*m_fullscreen; applyResolution(); } });
-    m_buttons.emplace_back( 0.10f, rowY(4), 0.30f, bh, "val_fullscreen",
+    m_buttons.emplace_back( 0.10f, rowY(9), 0.30f, bh, "val_fullscreen",
         [this](){ if(m_fullscreen) { *m_fullscreen = !*m_fullscreen; applyResolution(); } });
 
-    // Row 5: Resolution（点击展开下拉菜单）
-    m_buttons.emplace_back(-0.55f, rowY(5), 0.45f, bh, "Resolution",
+    // Row 10: Resolution（点击展开下拉菜单）
+    m_buttons.emplace_back(-0.55f, rowY(10), 0.45f, bh, "Resolution",
         [this](){ /* 标签，无动作 */ });
-    m_buttons.emplace_back( 0.10f, rowY(5), 0.30f, bh, "val_res",
+    m_buttons.emplace_back( 0.10f, rowY(10), 0.30f, bh, "val_res",
         [this](){ m_resDropdownOpen = !m_resDropdownOpen; });
 
     // Back
@@ -342,6 +387,8 @@ void Menu::drawMenuText(const std::string& text, float ndcX, float ndcY,
 }
 
 void Menu::drawButton(const Button& btn, bool hovered, int scrW, int scrH) {
+    // Settings 页面左侧标签文字不高亮
+    if (m_state == MenuState::SETTINGS && btn.x < 0.0f) hovered = false;
     // 按钮背景
     float br = hovered ? 0.3f : 0.15f;
     float bg = hovered ? 0.5f : 0.25f;
@@ -364,6 +411,18 @@ void Menu::drawButton(const Button& btn, bool hovered, int scrW, int scrH) {
             label = *m_autoExposure ? "ON" : "OFF";
         } else if (btn.text == "val_wire") {
             label = *m_wireframe ? "ON" : "OFF";
+        } else if (btn.text == "val_direct") {
+            label = m_directOutput && *m_directOutput ? "ON" : "OFF";
+        } else if (btn.text == "val_test") {
+            label = m_testRedSphere && *m_testRedSphere ? "ON" : "OFF";
+        } else if (btn.text == "val_gbuf") {
+            label = m_debugGBuffer && *m_debugGBuffer ? "ON" : "OFF";
+        } else if (btn.text == "val_diag") {
+            label = m_extremeDiagnose && *m_extremeDiagnose ? "ON" : "OFF";
+        } else if (btn.text == "val_exp") {
+            char ebuf[16];
+            snprintf(ebuf, sizeof(ebuf), "%+.1f", m_manualExposure ? *m_manualExposure : 0.0f);
+            label = ebuf;
         } else if (btn.text == "val_fullscreen") {
             label = *m_fullscreen ? "ON" : "OFF";
         } else if (btn.text == "val_res") {
@@ -672,19 +731,15 @@ void Menu::render(int screenW, int screenH) {
             {"  WASD     Move F/L/B/R",   false},
             {"  R/F      Up/Down",        false},
             {"  Q/E      Roll L/R",        false},
-            {"  Mouse    Look, Scroll=Spd",false},
-            {"Display:",                    true},
-            {"  N        Direct output",    false},
-            {"  T        Test sphere",      false},
-            {"  G        G-Buffer debug",  false},
-            {"  X        Diagnose",         false},
-            {"  KP+/-    Exposure +/-0.5", false},
+            {"  Mouse    Look",            false},
+            {"  Scroll   Speed +/-",        false},
+            {"  Shift+Scroll Time+/-",     false},
             {"System:",                    true},
             {"  ESC      Menu / Pause",    false},
         };
         const float dimCol[3] = {0.5f, 0.5f, 0.5f};
         const float valCol[3] = {0.85f, 0.85f, 0.85f};
-        float kScale = 15.0f;
+        float kScale = (float)screenH * 0.02f;
         float rowH   = kScale * 1.3f / (float)screenH * 2.0f;
         int numLines = (int)(sizeof(lines)/sizeof(lines[0]));
         float totalBlockNDC = (numLines - 1) * rowH;  // 文本块 NDC 总高度

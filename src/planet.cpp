@@ -200,6 +200,8 @@ void Planet::drawEmissive(unsigned int shader, unsigned int sphereVAO, int index
     glUniform3fv(glGetUniformLocation(shader, "cameraPos"), 1, glm::value_ptr(viewPos));
     glUniform3fv(glGetUniformLocation(shader, "uSunColor"), 1, glm::value_ptr(color));
     glUniform1f(glGetUniformLocation(shader, "uSunIntensity"), sunIntensity);
+    // planet.vert 第21行: FragPos = relPos + cameraPos，已还原世界坐标
+    // 因此 viewPos 必须是世界空间相机坐标，不能是 (0,0,0)
     glUniform3fv(glGetUniformLocation(shader, "viewPos"), 1, glm::value_ptr(viewPos));
 
     glBindVertexArray(sphereVAO);

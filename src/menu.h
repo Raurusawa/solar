@@ -32,7 +32,9 @@ public:
     void handleScroll(double yoffset);
     void render(int screenW, int screenH);
 
-    void setGlobals(bool* bloom, bool* flare, bool* autoExp, float* bn, float* fl,
+    void setGlobals(bool* bloom, bool* flare, bool* autoExp,
+                    bool* directOut, bool* testRed, bool* debugGBuf, bool* extremeDiag,
+                    float* bn, float* fl,
                     float* manExp, bool* wireframe,
                     int* resIndex, bool* fullscr, int* scrW, int* scrH);
 
@@ -70,6 +72,10 @@ private:
     bool* m_bloomEnabled = nullptr;
     bool* m_flareEnabled = nullptr;
     bool* m_autoExposure = nullptr;
+    bool* m_directOutput = nullptr;
+    bool* m_testRedSphere = nullptr;
+    bool* m_debugGBuffer = nullptr;
+    bool* m_extremeDiagnose = nullptr;
     float* m_bloomStrength = nullptr;
     float* m_flareIntensity = nullptr;
     float* m_manualExposure = nullptr;
