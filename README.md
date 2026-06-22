@@ -247,6 +247,42 @@ G-Buffer (MRT)
 
 ---
 
+## 打包发布
+
+`Release/` 目录已包含运行所需的所有非系统 DLL（共 17 个）。分发时只需将以下文件放在一起：
+
+```
+Release/
+├── solar_system.exe
+├── config.ini
+├── src/shaders/      ← 整个文件夹
+├── textures/         ← 整个文件夹
+└── *.dll             ← 17 个 MinGW 运行时 DLL
+```
+
+**依赖 DLL 清单**（均已包含在 `Release/` 中）：
+
+| DLL | 用途 |
+|---|---|
+| `glew32.dll` | OpenGL 扩展加载 |
+| `glfw3.dll` | 窗口 & 输入 |
+| `libfreetype-6.dll` | 字体渲染 |
+| `libharfbuzz-0.dll` | 文字塑形 |
+| `libglib-2.0-0.dll` | GLib 工具库 |
+| `libgraphite2.dll` | 文字渲染引擎 |
+| `libpng16-16.dll` | PNG 纹理加载 |
+| `zlib1.dll` | 压缩（libpng 依赖） |
+| `libbz2-1.dll` | BZIP2 压缩 |
+| `libbrotlidec.dll` / `libbrotlienc.dll` / `libbrotlicommon.dll` | Brotli 压缩（FreeType 依赖） |
+| `libiconv-2.dll` | 字符编码转换 |
+| `libintl-8.dll` | 国际化支持 |
+| `libpcre2-8-0.dll` | 正则表达式（GLib 依赖） |
+| `libgcc_s_seh-1.dll` / `libstdc++-6.dll` / `libwinpthread-1.dll` | GCC/MinGW 运行时 |
+
+系统 DLL（`KERNEL32.dll`、`USER32.dll`、`OPENGL32.dll` 等）由 Windows 自动提供，无需分发。
+
+---
+
 ## License
 
 MIT
